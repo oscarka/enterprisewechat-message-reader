@@ -1,0 +1,22 @@
+{
+  "name": "wechat-archiver",
+  "version": "1.0.0",
+  "description": "企微会话存档拉取 + 客户姓名解析服务，独立部署于 Cloud Run",
+  "main": "archiver.js",
+  "scripts": {
+    "start": "node archiver.js",
+    "dev": "node archiver.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@google-cloud/speech": "^7.5.0",
+    "@google-cloud/storage": "^7.11.0",
+    "@google/genai": "^2.13.0",
+    "axios": "^1.14.0",
+    "dotenv": "^17.4.0",
+    "pg": "^8.22.0",
+    "wework-chat-node": "^1.2.0"
+  }
+}
