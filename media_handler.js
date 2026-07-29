@@ -20,17 +20,13 @@
 
 const { Storage }     = require('@google-cloud/storage');
 const { GoogleGenAI } = require('@google/genai');
-const speech          = require('@google-cloud/speech');
+// const speech       = require('@google-cloud/speech');  // 已改用 Gemini 转写
 
 const MEDIA_BUCKET    = process.env.MEDIA_BUCKET || 'wechat-archiver-media';
 const INLINE_MAX_BYTES = 14 * 1024 * 1024; // 14MB：低于 Gemini 15MB 限制
 
 // 懒加载客户端（Cloud Run 中 ADC 自动生效）
-let _speechClient = null;
-function getSpeechClient() {
-    if (!_speechClient) _speechClient = new speech.SpeechClient();
-    return _speechClient;
-}
+// Cloud STT 已弃用，改用 Gemini 转写
 
 function _log(type, extra = {}) {
     console.log(JSON.stringify({ severity: 'INFO', type, ...extra, ts: new Date().toISOString() }));
@@ -98,40 +94,39 @@ async function _describeImage(buffer, gcsUrl) {
     }
 }
 
-// ─── Google Cloud Speech-to-Text 语音转文字 ───────────────────────────────────
+// ─── Gemini 语音转文字（替代 Cloud STT，更可靠） ──────────────────────────────
 
 async function _transcribeAudio(buffer) {
-    try {
-        const client = getSpeechClient();
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+        _log('stt_error', { message: 'GEMINI_API_KEY not set' });
+        return null;
+    }
 
-        // 企微存档语音格式：AMR（Adaptive Multi-Rate）
-        // 采样率：8000Hz（AMR 标准），8bit，单声道
-        const [response] = await client.recognize({
-            config: {
-                encoding:        'AMR',
-                sampleRateHertz: 8000,
-                languageCode:    'zh-CN',
-                model:           'default',    // phone_call 不支持 zh-CN，用 default
-                enableAutomaticPunctuation: true,
-            },
-            audio: {
-                content: buffer.toString('base64'),
-            },
+    try {
+        const { GoogleGenAI } = require('@google/genai');
+        const ai = new GoogleGenAI({ apiKey });
+
+        const resp = await ai.models.generateContent({
+            model: 'gemini-2.5-flash-lite',
+            contents: [{
+                parts: [
+                    { text: '请将这段语音转写为文字，只输出转写内容，不要加任何解释或标点说明：' },
+                    { inlineData: { mimeType: 'audio/amr', data: buffer.toString('base64') } },
+                ],
+            }],
         });
 
-        const transcript = response.results
-            ?.map(r => r.alternatives?.[0]?.transcript || '')
-            .filter(Boolean)
-            .join('');
-
+        const transcript = (resp.text || '').trim();
         if (!transcript) {
-            _log('stt_empty', { reason: '转写结果为空，可能是静音或格式不匹配' });
+            _log('stt_empty', { reason: 'Gemini 转写结果为空' });
             return null;
         }
 
+        _log('stt_success', { engine: 'gemini', chars: transcript.length, preview: transcript.substring(0, 50) });
         return transcript;
     } catch (e) {
-        _log('stt_error', { message: e.message });
+        _log('stt_error', { engine: 'gemini', message: e.message });
         return null;
     }
 }
