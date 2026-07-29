@@ -53,7 +53,7 @@ ${contents.map((c, i) => `${i + 1}. ${c}`).join('\n')}
 只回答 yes（完整）或 no（可能还有后续）。`;
 
         const resp = await ai.models.generateContent({
-            model:    'gemini-2.0-flash-lite',
+            model:    'gemini-2.5-flash-lite',
             contents: prompt,
         });
         const text = (resp.text || '').trim().toLowerCase();
