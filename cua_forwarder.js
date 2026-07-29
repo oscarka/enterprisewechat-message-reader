@@ -2,107 +2,119 @@
  * cua_forwarder.js
  * 将企微入站消息转发给 CUA 平台，触发 AI 回复
  *
- * ─── 【给 CUA 平台方的 API 变更说明】─────────────────────────────────────────
+ * ─── 幂等 + 重试机制 ───────────────────────────────────────────────────────
  *
- * 当前限制（ingest-api 文档 L311）：
- *   "Delivery 目标目前为固定值：recipient 和 app 由 .env 统一配置"
+ * 1. 每条消息带 idempotency_key（企微 msgid），CUA 侧用 Redis 去重
+ *    → 重试时即使消息已处理，也不会被重复入队
  *
- * 本服务在 meta 字段新增以下字段，请 CUA 平台侧支持：
+ * 2. 遇到 5xx 错误自动重试（最多 3 次，间隔 5s / 10s / 20s）
+ *    → 解决 CUA backend 短暂重启/502 导致消息丢失的问题
  *
- * meta.recipient  (string) - 消息发送方的名称（即 CUA 应该回复给谁）
- *                             例: "oscar"
- *                             CUA 应优先用此值作为 delivery.recipient
- *                             而非读取固定 .env 值
+ * 3. 所有重试耗尽后记录 cua_forward_dead 日志（供人工补发）
  *
- * meta.app        (string) - 回复所用的 App（目前固定为"企业微信"）
- *                             例: "企业微信"
+ * ─── meta 字段说明（给 CUA 平台方）────────────────────────────────────────
  *
- * meta.user_id    (string) - 外部联系人唯一 ID（企微 external_userid）
- *                             例: "wm9xuHYgAA6TFURBHCp83TkkPgYatcmQ"
- *                             建议 CUA 平台用此值作为 session_id 的依据
+ * meta.recipient  - 消息发送方名称，CUA 回复给谁
+ * meta.app        - "企业微信"
+ * meta.user_id    - 外部联系人 ID（企微 external_userid）
  *
- * 推荐的 session_id 格式：直接使用 external_user_id，可保证每个客户的对话历史独立
- *
- * ─────────────────────────────────────────────────────────────────────────────
+ * ─────────────────────────────────────────────────────────────────────────
  */
 
 const axios = require('axios');
 
-// CUA 平台的 /api/ingest 地址（通过 Cloudflare Tunnel 或 Tailscale IP 访问）
-const CUA_INGEST_URL = process.env.CUA_INGEST_URL; // 例: https://xxx.trycloudflare.com/api/ingest
+const CUA_INGEST_URL = process.env.CUA_INGEST_URL;
+const MAX_RETRY      = 3;
+const RETRY_DELAY_MS = [5000, 10000, 20000]; // 指数退避
 
 /**
- * 将一条入站消息（客户 → 员工）转发给 CUA 平台
+ * 将一条入站消息转发给 CUA 平台
  *
  * @param {Object} opts
  * @param {string} opts.content          - 消息文本内容
- * @param {string} opts.externalUserId   - 外部联系人 ID (wm... / wo...)
- * @param {string} opts.externalUserName - 外部联系人名称（用于 CUA 找到对话窗口）
+ * @param {string} opts.externalUserId   - 外部联系人 ID
+ * @param {string} opts.externalUserName - 外部联系人名称
  * @param {string} opts.employeeUserId   - 员工 ID
  * @param {string} opts.employeeName     - 员工名称
  * @param {Array}  opts.history          - 近期对话历史 [{role, content}]
+ * @param {string} opts.msgId            - 企微消息 ID（幂等键，防重试重复处理）
  */
 async function forwardToCua(opts) {
-    if (!CUA_INGEST_URL) {
-        // 未配置 CUA_INGEST_URL 时静默跳过（不影响存档功能）
-        return;
-    }
+    if (!CUA_INGEST_URL) return;
 
-    const { content, externalUserId, externalUserName, employeeUserId, employeeName, history } = opts;
+    const { content, externalUserId, externalUserName, employeeUserId, employeeName, history, msgId } = opts;
 
-    // 从 CUA_INGEST_URL 推导 callback_url（把 /api/ingest 换成 /api/agent-callback）
-    const cuaBase = CUA_INGEST_URL.replace(/\/api\/ingest.*$/, '');
+    const cuaBase   = CUA_INGEST_URL.replace(/\/api\/ingest.*$/, '');
     const callbackUrl = `${cuaBase}/api/agent-callback`;
 
     const body = {
         content,
-        source:     'wecom',
-        session_id: externalUserId,              // 用外部联系人 ID 作为会话 ID，保持对话独立
+        source:          'wecom',
+        session_id:      externalUserId,
+        idempotency_key: msgId || '',          // 企微 msgid → CUA 侧 Redis 去重
         meta: {
-            from_name:  externalUserName || externalUserId,
-            user_id:    externalUserId,
-            // ↓ 新增字段：告诉 CUA 平台应该回复给谁（见上方 API 变更说明）
-            recipient:  externalUserName || externalUserId,
-            app:        '企业微信',
-            channel:    'wecom_archive',
-            employee:   employeeName || employeeUserId, // 哪个员工账号在对话
+            from_name: externalUserName || externalUserId,
+            user_id:   externalUserId,
+            recipient: externalUserName || externalUserId,
+            app:       '企业微信',
+            channel:   'wecom_archive',
+            employee:  employeeName || employeeUserId,
         },
-        // 传入最近对话历史，让 AI 有上下文
         ...(history && history.length > 0 ? { history } : {}),
-        // callback_url：skill 异步执行完后回调此地址推送结果
         callback_url: callbackUrl,
     };
 
-    try {
-        // 新接口：POST → 立即返回 202 Accepted + task_id，后台异步处理
-        // 无需等待 SSE 流，直接拿到响应即可
-        const resp = await axios.post(CUA_INGEST_URL, body, {
-            timeout:        15000,
-            validateStatus: (s) => s < 500,
-        });
+    for (let attempt = 0; attempt <= MAX_RETRY; attempt++) {
+        try {
+            const resp = await axios.post(CUA_INGEST_URL, body, {
+                timeout:        15000,
+                validateStatus: (s) => s < 500,  // 5xx → catch → 重试；4xx → 业务错误不重试
+            });
 
-        // 如果是旧 SSE 接口（200 + stream），销毁流避免内存泄漏
-        if (resp.data && typeof resp.data.destroy === 'function') {
-            resp.data.destroy();
+            if (resp.data && typeof resp.data.destroy === 'function') resp.data.destroy();
+
+            console.log(JSON.stringify({
+                type:            'cua_forwarded',
+                httpStatus:      resp.status,
+                taskId:          resp.data?.task_id || '-',
+                accepted:        resp.data?.status  || resp.status,
+                attempt,
+                externalUserId,
+                externalUserName,
+                contentLen:      content.length,
+                historyLen:      (history || []).length,
+                msgId:           msgId || '-',
+                ts:              new Date().toISOString(),
+            }));
+            return; // ✅ 成功
+
+        } catch (err) {
+            if (attempt >= MAX_RETRY) {
+                // 所有重试耗尽 → 死信日志（人工可查）
+                console.error(JSON.stringify({
+                    type:           'cua_forward_dead',
+                    error:          err.message,
+                    attempts:       attempt + 1,
+                    externalUserId,
+                    externalUserName,
+                    contentPreview: content.slice(0, 80),
+                    msgId:          msgId || '-',
+                    ts:             new Date().toISOString(),
+                }));
+            } else {
+                const delayMs = RETRY_DELAY_MS[attempt] || 20000;
+                console.warn(JSON.stringify({
+                    type:     'cua_forward_retry',
+                    attempt:  attempt + 1,
+                    maxRetry: MAX_RETRY,
+                    delayMs,
+                    error:    err.message,
+                    msgId:    msgId || '-',
+                    ts:       new Date().toISOString(),
+                }));
+                await new Promise(resolve => setTimeout(resolve, delayMs));
+            }
         }
-
-        const taskId   = resp.data?.task_id || '-';
-        const accepted = resp.data?.status   || resp.status;
-
-        console.log(JSON.stringify({
-            type:            'cua_forwarded',
-            httpStatus:      resp.status,
-            taskId,
-            accepted,
-            externalUserId,
-            externalUserName,
-            contentLen:      content.length,
-            historyLen:      (history || []).length,
-            ts:              new Date().toISOString(),
-        }));
-    } catch (err) {
-        // 转发失败不影响存档（降级处理）
-        console.error('[CUA] 转发失败:', err.message);
     }
 }
 

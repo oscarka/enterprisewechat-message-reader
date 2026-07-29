@@ -309,6 +309,7 @@ async function main() {
                                 externalUserName: result.externalUserName,
                                 employeeUserId:   result.employeeUserId,
                                 employeeName:     result.employeeName,
+                                msgId:            result.msgid || '',  // 幂等键：企微消息 ID
                             };
 
                             // 防抖聚合：5s 内连发的消息合并后才触发 CUA
@@ -328,9 +329,8 @@ async function main() {
                                         employeeUserId:   flushMeta.employeeUserId,
                                         employeeName:     flushMeta.employeeName,
                                         history,
-                                    }).catch(e =>
-                                        log('WARNING', 'cua_forward_failed', { message: e.message })
-                                    );
+                                        msgId:            flushMeta.msgId || '',  // 企微 msgid 作为幂等键
+                                    });
                                 }
                             );
                         }
