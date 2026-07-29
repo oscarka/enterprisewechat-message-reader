@@ -69,8 +69,6 @@ async function forwardToCua(opts) {
         },
         // 传入最近对话历史，让 AI 有上下文
         ...(history && history.length > 0 ? { history } : {}),
-        // skill_id：从环境变量读取，留空时 skill-platform 自动路由
-        ...(process.env.CUA_SKILL_ID ? { skill_id: process.env.CUA_SKILL_ID } : {}),
         // callback_url：skill 异步执行完后回调此地址推送结果
         callback_url: callbackUrl,
     };
