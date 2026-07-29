@@ -83,7 +83,7 @@ async function _describeImage(buffer, gcsUrl) {
         }
 
         const resp = await ai.models.generateContent({
-            model: 'gemini-2.0-flash-lite',
+            model: 'gemini-2.5-flash-lite',
             contents: [{
                 parts: [
                     { text: '请用1-2句话简洁描述这张图片的主要内容（直接描述，不要解释）：' },
@@ -111,7 +111,7 @@ async function _transcribeAudio(buffer) {
                 encoding:        'AMR',
                 sampleRateHertz: 8000,
                 languageCode:    'zh-CN',
-                model:           'phone_call', // 针对电话/语音消息优化
+                model:           'default',    // phone_call 不支持 zh-CN，用 default
                 enableAutomaticPunctuation: true,
             },
             audio: {
