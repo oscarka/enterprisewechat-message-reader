@@ -26,7 +26,7 @@ const { WeWorkChat } = require('wework-chat-node');
 const NameResolver  = require('./name_resolver');
 const SeqStore      = require('./seq_store');
 const { initSchema, saveMessage, getRecentHistory } = require('./supabase_store');
-const { forwardToCua } = require('./cua_forwarder');
+const { forwardToCua, forwardToSkillPlatform } = require('./cua_forwarder');
 const { enqueue }      = require('./message_debouncer');
 const { handleMedia }  = require('./media_handler');
 
@@ -329,7 +329,18 @@ async function main() {
                                         employeeUserId:   flushMeta.employeeUserId,
                                         employeeName:     flushMeta.employeeName,
                                         history,
-                                        msgId:            flushMeta.msgId || '',  // 企微 msgid 作为幂等键
+                                        msgId:            flushMeta.msgId || '',
+                                    });
+                                    // 并行转发给 Skill Platform（日志集中化）
+                                    forwardToSkillPlatform({
+                                        content:          combined,
+                                        externalUserId:   flushMeta.externalUserId,
+                                        externalUserName: flushMeta.externalUserName,
+                                        employeeUserId:   flushMeta.employeeUserId,
+                                        employeeName:     flushMeta.employeeName,
+                                        history,
+                                        msgId:            flushMeta.msgId || '',
+                                        msgtype:          'text',
                                     });
                                 }
                             );

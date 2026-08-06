@@ -23,9 +23,11 @@
 
 const axios = require('axios');
 
-const CUA_INGEST_URL = process.env.CUA_INGEST_URL;
-const MAX_RETRY      = 3;
-const RETRY_DELAY_MS = [5000, 10000, 20000]; // 指数退避
+const CUA_INGEST_URL         = process.env.CUA_INGEST_URL;
+const SKILL_PLATFORM_URL     = process.env.SKILL_PLATFORM_URL; // 新增：直接转发给 Skill Platform
+const MAX_RETRY              = 3;
+const RETRY_DELAY_MS         = [5000, 10000, 20000]; // 指数退避
+
 
 /**
  * 将一条入站消息转发给 CUA 平台
@@ -118,4 +120,49 @@ async function forwardToCua(opts) {
     }
 }
 
-module.exports = { forwardToCua };
+/**
+ * 并行转发给 Skill Platform（/api/orch/ingest）
+ * fire-and-forget，不阻塞 CUA 转发流程
+ */
+function forwardToSkillPlatform(opts) {
+    if (!SKILL_PLATFORM_URL) return;
+
+    const { content, externalUserId, externalUserName, employeeUserId, employeeName, history, msgId, msgtype } = opts;
+
+    const body = {
+        from_name:       externalUserName || externalUserId,
+        from_user_id:    externalUserId,
+        content,
+        msgtype:         msgtype || 'text',
+        channel:         'wecom',
+        conversation_id: externalUserId,
+        employee_id:     employeeUserId,
+        employee_name:   employeeName,
+        history:         history || [],
+        idempotency_key: msgId || '',
+    };
+
+    const url = SKILL_PLATFORM_URL.replace(/\/?$/, '') + '/api/orch/ingest';
+
+    axios.post(url, body, { timeout: 10000 })
+        .then(resp => {
+            console.log(JSON.stringify({
+                type:       'skill_platform_forwarded',
+                httpStatus: resp.status,
+                url,
+                externalUserId,
+                externalUserName,
+                ts:         new Date().toISOString(),
+            }));
+        })
+        .catch(err => {
+            console.warn(JSON.stringify({
+                type:  'skill_platform_forward_fail',
+                error: err.message,
+                url,
+                ts:    new Date().toISOString(),
+            }));
+        });
+}
+
+module.exports = { forwardToCua, forwardToSkillPlatform };
