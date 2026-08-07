@@ -79,10 +79,14 @@ async function saveMessage(msg) {
 async function getRecentHistory(externalUserId, limit = 20) {
     try {
         const { rows } = await pool.query(
-            `SELECT direction, content
+            `SELECT direction, msgtype, content
              FROM wechat_archiver.messages
              WHERE external_user_id = $1
-               AND msgtype = 'text'
+               AND (
+                 msgtype = 'text'
+                 OR (msgtype = 'voice' AND content != '')
+                 OR (msgtype = 'file'  AND content != '')
+               )
                AND content IS NOT NULL
                AND content != ''
              ORDER BY msg_time DESC
@@ -92,11 +96,21 @@ async function getRecentHistory(externalUserId, limit = 20) {
         // 倒序变升序（最新在末尾）
         return rows.reverse().map(r => ({
             role:    r.direction === 'inbound' ? 'user' : 'assistant',
-            content: r.content,
+            content: r.content,   // voice/file 的 content 已包含格式化前缀（如 [语音转文字] [文件: xxx | AI摘要: ...]）
         }));
     } catch (err) {
         console.error('[Supabase] getRecentHistory error:', err.message);
         return [];
+    }
+}
+async function updateMessageContent(msgid, content) {
+    try {
+        await pool.query(
+            `UPDATE wechat_archiver.messages SET content = $1 WHERE id = $2`,
+            [content, msgid]
+        );
+    } catch (err) {
+        console.error('[Supabase] updateMessageContent error:', err.message);
     }
 }
 
@@ -118,4 +132,4 @@ async function getLatestInboundTime(externalUserId) {
     }
 }
 
-module.exports = { initSchema, saveMessage, getRecentHistory, getLatestInboundTime };
+module.exports = { initSchema, saveMessage, getRecentHistory, updateMessageContent, getLatestInboundTime };

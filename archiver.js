@@ -25,7 +25,7 @@ const { WeWorkChat } = require('wework-chat-node');
 
 const NameResolver  = require('./name_resolver');
 const SeqStore      = require('./seq_store');
-const { initSchema, saveMessage, getRecentHistory } = require('./supabase_store');
+const { initSchema, saveMessage, getRecentHistory, updateMessageContent } = require('./supabase_store');
 const { forwardToCua, forwardToSkillPlatform } = require('./cua_forwarder');
 const { enqueue }      = require('./message_debouncer');
 const { handleMedia }  = require('./media_handler');
@@ -293,8 +293,9 @@ async function main() {
                         let itemContent  = result.content;  // 文本消息直接用
                         let itemMediaUrl = null;
 
-                        // 非语音媒体（图片/视频/文件）标记 mediaOnly，flush 时跳过 agent 转发
-                        const isMediaOnly = MEDIA_TYPES.has(result.msgtype) && result.msgtype !== 'voice';
+                        // 非语音媒体（图片/视频/文件）标记 mediaOnly，flush 时若仍无内容则静默
+                        // 注意：PDF 提取成功后会重置 isMediaOnly = false，确保 agent 能收到
+                        let isMediaOnly = MEDIA_TYPES.has(result.msgtype) && result.msgtype !== 'voice';
                         if (MEDIA_TYPES.has(result.msgtype)) {
                             // 媒体消息：立即下载（不等 flush，节省后续处理时间）
                             log('INFO', 'media_eager_download', {
@@ -311,6 +312,14 @@ async function main() {
                             });
                             itemContent  = mediaResult.content;
                             itemMediaUrl = mediaResult.mediaUrl;
+                            // 将 AI 分析结果存回 Supabase（确保语音转写/图片描述进入历史）
+                            if (itemContent && result.msgid) {
+                                await updateMessageContent(result.msgid, itemContent).catch(() => {});
+                            }
+                            // PDF 成功提取内容 → 视为有价值消息，取消 file-only skip
+                            if (result.msgtype === 'file' && itemContent && itemContent.includes('AI摘要:')) {
+                                isMediaOnly = false;
+                            }
                             log('INFO', 'media_download_done', {
                                 userId:   result.externalUserId,
                                 msgtype:  result.msgtype,

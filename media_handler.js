@@ -20,6 +20,8 @@
 
 const { Storage }     = require('@google-cloud/storage');
 const { GoogleGenAI } = require('@google/genai');
+let pdfParse; // 懒加载，避免启动时报错
+try { pdfParse = require('pdf-parse'); } catch(e) { /* pdf-parse 未安装，降级 */ }
 // const speech       = require('@google-cloud/speech');  // 已改用 Gemini 转写
 
 const MEDIA_BUCKET    = process.env.MEDIA_BUCKET || 'wechat-archiver-media';
@@ -91,6 +93,26 @@ async function _describeImage(buffer, gcsUrl) {
     } catch (e) {
         _log('vision_error', { message: e.message });
         return '[图片]';
+    }
+}
+
+// ─── Gemini 文档摘要 ─────────────────────────────────────────────────────────
+
+async function _summarizeDocument(text, filename) {
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) return text.slice(0, 300);
+    try {
+        const ai = new GoogleGenAI({ apiKey });
+        const resp = await ai.models.generateContent({
+            model: 'gemini-2.5-flash-lite',
+            contents: [{ parts: [{ text:
+                `请用2-3句话简洁概括以下文档的主要内容（文件名：${filename}），直接输出摘要，不要解释：\n\n${text.slice(0, 4000)}`
+            }] }],
+        });
+        return (resp.text || '').trim() || text.slice(0, 300);
+    } catch (e) {
+        _log('summarize_error', { message: e.message });
+        return text.slice(0, 300);
     }
 }
 
@@ -285,7 +307,28 @@ async function handleMedia(sdk, msg) {
             content = '[客户发来一段视频，请回复：收到视频，请问有什么可以帮您？]';
 
         } else if (msg.msgtype === 'file') {
-            content = `[客户发来文件：${msg.file?.filename || '未知文件'}]`;
+            const filename = msg.file?.filename || '未知文件';
+            const ext = (filename.split('.').pop() || '').toLowerCase();
+            if (pdfParse && ext === 'pdf') {
+                try {
+                    const pdfData = await pdfParse(buffer);
+                    const rawText = (pdfData.text || '').trim();
+                    if (rawText) {
+                        const summary = await _summarizeDocument(rawText, filename);
+                        content = `[文件: ${filename} | AI摘要: ${summary}]`;
+                        _log('pdf_extracted', { filename, chars: rawText.length, summaryLen: summary.length });
+                    } else {
+                        content = `[文件: ${filename}（扫描件/图片PDF，无可提取文字）]`;
+                        _log('pdf_no_text', { filename });
+                    }
+                } catch (e) {
+                    _log('pdf_parse_error', { message: e.message, filename });
+                    content = `[文件: ${filename}（PDF解析失败）]`;
+                }
+            } else {
+                // 非 PDF：存文件名，供 agent 了解有文件存在
+                content = `[客户发来文件：${filename}]`;
+            }
 
         } else {
             content = `[${msg.msgtype}]`;
