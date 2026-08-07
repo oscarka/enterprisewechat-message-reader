@@ -293,8 +293,10 @@ async function main() {
                         let itemContent  = result.content;  // 文本消息直接用
                         let itemMediaUrl = null;
 
+                        // 非语音媒体（图片/视频/文件）标记 mediaOnly，flush 时跳过 agent 转发
+                        const isMediaOnly = MEDIA_TYPES.has(result.msgtype) && result.msgtype !== 'voice';
                         if (MEDIA_TYPES.has(result.msgtype)) {
-                            // 媒体消息：下载 + 描述（异步，不阻塞主循环 seq 推进）
+                            // 媒体消息：立即下载（不等 flush，节省后续处理时间）
                             const mediaResult = await handleMedia(sdk, msg).catch(e => {
                                 log('WARNING', 'media_handle_failed', { message: e.message });
                                 return { content: `[${result.msgtype}]`, mediaUrl: null };
@@ -312,17 +314,26 @@ async function main() {
                                 msgId:            result.msgid || '',  // 幂等键：企微消息 ID
                             };
 
-                            // 防抖聚合：5s 内连发的消息合并后才触发 CUA
+                            // 防抖聚合：2s 内连发的消息合并后才触发转发
                             enqueue(
                                 result.externalUserId,
-                                { content: itemContent, mediaUrl: itemMediaUrl },
+                                { content: itemContent, mediaUrl: itemMediaUrl, mediaOnly: isMediaOnly },
                                 meta,
                                 async (items, flushMeta) => {
-                                    // 合并多条内容为一个完整 payload
+                                    // 纯文件批次（无文字/语音）：文件已下载，跳过 agent 转发
+                                    const hasTextOrVoice = items.some(i => !i.mediaOnly);
+                                    if (!hasTextOrVoice) {
+                                        log('INFO', 'debounce_file_only_skip', {
+                                            userId: flushMeta.externalUserId,
+                                            count:  items.length,
+                                            reason: '纯文件消息，已下载，不触发 agent',
+                                        });
+                                        return;
+                                    }
+                                    // 合并多条内容（文件描述也附带，让 agent 知道发了文件）
                                     const combined = items.map(i => i.content).join('\n');
                                     const history  = await getRecentHistory(flushMeta.externalUserId, 20)
                                         .catch(() => []);
-                                    // 统一走 Skill Platform（/api/orch/ingest），由 skill-platform 调度 CUA 发送
                                     await forwardToSkillPlatform({
                                         content:          combined,
                                         externalUserId:   flushMeta.externalUserId,

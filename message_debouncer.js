@@ -4,16 +4,16 @@
  * 对同一外部用户连发消息进行防抖聚合，避免用户分句发话时触发多次 CUA 调用。
  *
  * 策略：
- *  - 软定时器（默认 5s）：每收到消息重置；到期后用 Gemini Flash Lite 判断完整性
- *  - 单条短消息（≤ 20 字）直接视为完整，跳过 AI 判断（"你好" 5s 后立即发）
- *  - 硬定时器（默认 15s）：无论如何强制发送，防止用户一直不停打字
+ *  - 软定时器（默认 2s）：每收到消息重置；到期后用 Gemini Flash Lite 判断完整性
+ *  - 单条短消息（≤ 20 字）直接视为完整，跳过 AI 判断（"你好" 2s 后立即发）
+ *  - 硬定时器（默认 5s）：无论如何强制发送，防止用户一直不停打字
  *  - AI 判断宽松：问候语、陈述句、问句都算完整；只有明显未完成才等待
  */
 
 const { GoogleGenAI } = require('@google/genai');
 
-const SOFT_MS  = parseInt(process.env.DEBOUNCE_MS      || '5000',  10);
-const HARD_MS  = parseInt(process.env.DEBOUNCE_HARD_MS || '8000', 10);
+const SOFT_MS  = parseInt(process.env.DEBOUNCE_MS      || '2000',  10);
+const HARD_MS  = parseInt(process.env.DEBOUNCE_HARD_MS || '5000', 10);
 
 // Map<userId, { items, softTimer, hardTimer, meta }>
 const _buffers = new Map();
