@@ -59,6 +59,7 @@ gcloud run deploy "$SERVICE_NAME" \
   --max-instances 1 \
   --memory 512Mi \
   --cpu 1 \
+  --no-cpu-throttling \
   --vpc-connector wechat-connector \
   --vpc-egress all-traffic \
   --set-env-vars "$ENV_VARS"

@@ -94,19 +94,86 @@ async function _describeImage(buffer, gcsUrl) {
     }
 }
 
-// ─── Gemini 语音转文字（替代 Cloud STT，更可靠） ──────────────────────────────
+// ─── 火山引擎大模型 ASR（首选，速度快准确率高）──────────────────────────────
 
-async function _transcribeAudio(buffer) {
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) {
-        _log('stt_error', { message: 'GEMINI_API_KEY not set' });
-        return null;
-    }
+async function _transcribeWithVolcano(buffer) {
+    const appKey    = process.env.VOLCANO_APP_KEY;
+    const accessKey = process.env.VOLCANO_ACCESS_KEY;
+    const apiUrl    = process.env.VOLCANO_API_URL
+        || 'https://openspeech.bytedance.com/api/v3/auc/bigmodel/recognize/flash';
+
+    if (!appKey || !accessKey) return null;
+
+    const t0 = Date.now();
+    const reqId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
     try {
-        const { GoogleGenAI } = require('@google/genai');
-        const ai = new GoogleGenAI({ apiKey });
+        const https = require('https');
+        const body = JSON.stringify({
+            user:    { uid: appKey },
+            audio:   { data: buffer.toString('base64'), format: 'amr' },
+            request: { model_name: 'bigmodel' },
+        });
+        const url = new URL(apiUrl);
 
+        const transcript = await new Promise((resolve, reject) => {
+            const req = https.request({
+                hostname: url.hostname,
+                path:     url.pathname,
+                method:   'POST',
+                timeout:  12000,
+                headers: {
+                    'Content-Type':      'application/json',
+                    'Content-Length':    Buffer.byteLength(body),
+                    'X-Api-App-Key':     appKey,
+                    'X-Api-Access-Key':  accessKey,
+                    'X-Api-Resource-Id': 'volc.bigasr.auc_turbo',
+                    'X-Api-Request-Id':  reqId,
+                    'X-Api-Sequence':    '-1',
+                },
+            }, res => {
+                let data = '';
+                res.on('data', c => data += c);
+                res.on('end', () => {
+                    const statusCode = res.headers['x-api-status-code'];
+                    if (statusCode === '20000000' || res.statusCode === 200) {
+                        try {
+                            const j = JSON.parse(data);
+                            resolve(j?.result?.text?.trim() || '');
+                        } catch { resolve(''); }
+                    } else if (statusCode === '20000003') {
+                        resolve('(静音)');
+                    } else {
+                        reject(new Error(`volcano status=${statusCode} msg=${res.headers['x-api-message']}`));
+                    }
+                });
+            });
+            req.on('error',   reject);
+            req.on('timeout', () => { req.destroy(); reject(new Error('volcano timeout')); });
+            req.write(body);
+            req.end();
+        });
+
+        if (transcript) {
+            _log('stt_success', { engine: 'volcano', ms: Date.now()-t0, chars: transcript.length, preview: transcript.substring(0, 50) });
+            return transcript;
+        }
+        _log('stt_empty', { engine: 'volcano', reason: '转写结果为空' });
+        return null;
+    } catch (e) {
+        _log('stt_error', { engine: 'volcano', message: e.message, ms: Date.now()-t0 });
+        return null;
+    }
+}
+
+// ─── Gemini 语音转文字（备用 fallback）───────────────────────────────────────
+
+async function _transcribeWithGemini(buffer) {
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) return null;
+
+    try {
+        const ai = new GoogleGenAI({ apiKey });
         const resp = await ai.models.generateContent({
             model: 'gemini-2.5-flash-lite',
             contents: [{
@@ -116,19 +183,29 @@ async function _transcribeAudio(buffer) {
                 ],
             }],
         });
-
         const transcript = (resp.text || '').trim();
         if (!transcript) {
-            _log('stt_empty', { reason: 'Gemini 转写结果为空' });
+            _log('stt_empty', { engine: 'gemini', reason: '转写结果为空' });
             return null;
         }
-
         _log('stt_success', { engine: 'gemini', chars: transcript.length, preview: transcript.substring(0, 50) });
         return transcript;
     } catch (e) {
         _log('stt_error', { engine: 'gemini', message: e.message });
         return null;
     }
+}
+
+// ─── 统一 STT 入口：火山首选 → Gemini 备用 ───────────────────────────────────
+
+async function _transcribeAudio(buffer) {
+    // 1. 火山大模型 ASR（速度快、中文准确率高）
+    const volcResult = await _transcribeWithVolcano(buffer);
+    if (volcResult) return volcResult;
+
+    // 2. Gemini fallback
+    _log('stt_fallback_to_gemini', { reason: '火山ASR未返回结果，尝试Gemini' });
+    return await _transcribeWithGemini(buffer);
 }
 
 // ─── 对外接口 ─────────────────────────────────────────────────────────────────

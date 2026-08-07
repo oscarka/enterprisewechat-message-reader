@@ -322,17 +322,8 @@ async function main() {
                                     const combined = items.map(i => i.content).join('\n');
                                     const history  = await getRecentHistory(flushMeta.externalUserId, 20)
                                         .catch(() => []);
-                                    await forwardToCua({
-                                        content:          combined,
-                                        externalUserId:   flushMeta.externalUserId,
-                                        externalUserName: flushMeta.externalUserName,
-                                        employeeUserId:   flushMeta.employeeUserId,
-                                        employeeName:     flushMeta.employeeName,
-                                        history,
-                                        msgId:            flushMeta.msgId || '',
-                                    });
-                                    // 并行转发给 Skill Platform（日志集中化）
-                                    forwardToSkillPlatform({
+                                    // 统一走 Skill Platform（/api/orch/ingest），由 skill-platform 调度 CUA 发送
+                                    await forwardToSkillPlatform({
                                         content:          combined,
                                         externalUserId:   flushMeta.externalUserId,
                                         externalUserName: flushMeta.externalUserName,

@@ -124,8 +124,11 @@ async function forwardToCua(opts) {
  * 并行转发给 Skill Platform（/api/orch/ingest）
  * fire-and-forget，不阻塞 CUA 转发流程
  */
-function forwardToSkillPlatform(opts) {
-    if (!SKILL_PLATFORM_URL) return;
+async function forwardToSkillPlatform(opts) {
+    if (!SKILL_PLATFORM_URL) {
+        console.warn(JSON.stringify({ type: 'skill_platform_skip', reason: 'SKILL_PLATFORM_URL not set', ts: new Date().toISOString() }));
+        return;
+    }
 
     const { content, externalUserId, externalUserName, employeeUserId, employeeName, history, msgId, msgtype } = opts;
 
@@ -144,25 +147,24 @@ function forwardToSkillPlatform(opts) {
 
     const url = SKILL_PLATFORM_URL.replace(/\/?$/, '') + '/api/orch/ingest';
 
-    axios.post(url, body, { timeout: 10000 })
-        .then(resp => {
-            console.log(JSON.stringify({
-                type:       'skill_platform_forwarded',
-                httpStatus: resp.status,
-                url,
-                externalUserId,
-                externalUserName,
-                ts:         new Date().toISOString(),
-            }));
-        })
-        .catch(err => {
-            console.warn(JSON.stringify({
-                type:  'skill_platform_forward_fail',
-                error: err.message,
-                url,
-                ts:    new Date().toISOString(),
-            }));
-        });
+    try {
+        const resp = await axios.post(url, body, { timeout: 15000 });
+        console.log(JSON.stringify({
+            type:       'skill_platform_forwarded',
+            httpStatus: resp.status,
+            url,
+            externalUserId,
+            externalUserName,
+            ts:         new Date().toISOString(),
+        }));
+    } catch (err) {
+        console.warn(JSON.stringify({
+            type:  'skill_platform_forward_fail',
+            error: err.message,
+            url,
+            ts:    new Date().toISOString(),
+        }));
+    }
 }
 
 module.exports = { forwardToCua, forwardToSkillPlatform };
