@@ -100,4 +100,22 @@ async function getRecentHistory(externalUserId, limit = 20) {
     }
 }
 
-module.exports = { initSchema, saveMessage, getRecentHistory };
+async function getLatestInboundTime(externalUserId) {
+    try {
+        const { rows } = await pool.query(
+            `SELECT msg_time
+             FROM wechat_archiver.messages
+             WHERE external_user_id = $1
+               AND direction = 'inbound'
+             ORDER BY msg_time DESC
+             LIMIT 1`,
+            [externalUserId]
+        );
+        return rows[0]?.msg_time ? new Date(rows[0].msg_time).getTime() : 0;
+    } catch (err) {
+        console.error('[Supabase] getLatestInboundTime error:', err.message);
+        return 0;
+    }
+}
+
+module.exports = { initSchema, saveMessage, getRecentHistory, getLatestInboundTime };
