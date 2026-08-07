@@ -297,12 +297,26 @@ async function main() {
                         const isMediaOnly = MEDIA_TYPES.has(result.msgtype) && result.msgtype !== 'voice';
                         if (MEDIA_TYPES.has(result.msgtype)) {
                             // 媒体消息：立即下载（不等 flush，节省后续处理时间）
+                            log('INFO', 'media_eager_download', {
+                                userId:    result.externalUserId,
+                                msgtype:   result.msgtype,
+                                isMediaOnly,
+                                reason:    isMediaOnly
+                                    ? '立即下载，标记 mediaOnly（flush 时若无文字/语音则静默）'
+                                    : '语音消息，立即下载 + 进入防抖队列',
+                            });
                             const mediaResult = await handleMedia(sdk, msg).catch(e => {
                                 log('WARNING', 'media_handle_failed', { message: e.message });
                                 return { content: `[${result.msgtype}]`, mediaUrl: null };
                             });
                             itemContent  = mediaResult.content;
                             itemMediaUrl = mediaResult.mediaUrl;
+                            log('INFO', 'media_download_done', {
+                                userId:   result.externalUserId,
+                                msgtype:  result.msgtype,
+                                content:  (itemContent || '').substring(0, 50),
+                                hasUrl:   !!itemMediaUrl,
+                            });
                         }
 
                         if (itemContent) {
@@ -324,14 +338,25 @@ async function main() {
                                     const hasTextOrVoice = items.some(i => !i.mediaOnly);
                                     if (!hasTextOrVoice) {
                                         log('INFO', 'debounce_file_only_skip', {
-                                            userId: flushMeta.externalUserId,
-                                            count:  items.length,
-                                            reason: '纯文件消息，已下载，不触发 agent',
+                                            userId:    flushMeta.externalUserId,
+                                            count:     items.length,
+                                            types:     items.map(i => i.content?.split(']')[0]?.replace('[','') || 'file').join(','),
+                                            reason:    '纯文件消息批次，已提前下载，不触发 agent',
                                         });
                                         return;
                                     }
                                     // 合并多条内容（文件描述也附带，让 agent 知道发了文件）
+                                    const mediaCount = items.filter(i => i.mediaOnly).length;
+                                    const textCount  = items.filter(i => !i.mediaOnly).length;
                                     const combined = items.map(i => i.content).join('\n');
+                                    log('INFO', 'debounce_flush_forward', {
+                                        userId:     flushMeta.externalUserId,
+                                        total:      items.length,
+                                        textCount,
+                                        mediaCount,
+                                        combined_preview: combined.substring(0, 80),
+                                    });
+
                                     const history  = await getRecentHistory(flushMeta.externalUserId, 20)
                                         .catch(() => []);
                                     await forwardToSkillPlatform({
