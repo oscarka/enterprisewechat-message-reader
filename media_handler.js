@@ -21,7 +21,10 @@
 const { Storage }     = require('@google-cloud/storage');
 const { GoogleGenAI } = require('@google/genai');
 let pdfParse; // 懒加载，避免启动时报错
-try { pdfParse = require('pdf-parse'); } catch(e) { /* pdf-parse 未安装，降级 */ }
+try { 
+    const mod = require('pdf-parse');
+    pdfParse = typeof mod === 'function' ? mod : (mod.PDFParse || mod.default);
+} catch(e) { /* pdf-parse 未安装，降级 */ }
 // const speech       = require('@google-cloud/speech');  // 已改用 Gemini 转写
 
 const MEDIA_BUCKET    = process.env.MEDIA_BUCKET || 'wechat-archiver-media';
