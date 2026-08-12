@@ -20,11 +20,15 @@ gsutil mb -p $PROJECT_ID -l $REGION "gs://$BUCKET" 2>/dev/null \
   && echo "✅ 桶已创建" \
   || echo "ℹ️  桶已存在，跳过"
 
-# 把当前进度文件上传到 GCS（首次部署用，避免从头重跑）
+# 把当前进度文件上传到 GCS（仅首次：GCS 上不存在时才上传，避免覆盖已有进度）
 if [ -f "data/archiving_seq.json" ]; then
-  echo "📤 上传初始 seq 文件到 GCS ..."
-  gsutil cp data/archiving_seq.json "gs://$BUCKET/archiver_seq.json"
-  echo "✅ 初始 seq 已上传"
+  if gsutil -q stat "gs://$BUCKET/archiver_seq.json" 2>/dev/null; then
+    echo "ℹ️  GCS 上已有 seq 文件，跳过上传（保留已有进度，防止历史消息重播）"
+  else
+    echo "📤 首次部署，上传初始 seq 文件到 GCS ..."
+    gsutil cp data/archiving_seq.json "gs://$BUCKET/archiver_seq.json"
+    echo "✅ 初始 seq 已上传"
+  fi
 fi
 
 # 2. 构建镜像

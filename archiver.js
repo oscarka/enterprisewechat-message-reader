@@ -34,7 +34,7 @@ const { handleMedia }  = require('./media_handler');
 const MEDIA_TYPES = new Set(['image', 'voice', 'video', 'file']);
 
 // ─── 配置 ─────────────────────────────────────────────────────
-const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || '3000', 10);
+const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || '500', 10);
 const PRIVATE_KEY_PATH = path.join(__dirname, 'data', 'rsa_keys', 'private.pem');
 
 // ─── 工具函数 ─────────────────────────────────────────────────
@@ -102,9 +102,11 @@ async function processMessage(msg, nameResolver) {
     const roomid   = msg.roomid || '';
     const seq      = msg.seq;
 
-    // 解析发送方和接收方姓名
-    const fromName = await nameResolver.resolve(fromId);
-    const toName   = toId ? await nameResolver.resolve(toId) : null;
+    // 解析发送方和接收方姓名（并行，不互相依赖）
+    const [fromName, toName] = await Promise.all([
+        nameResolver.resolve(fromId),
+        toId ? nameResolver.resolve(toId) : Promise.resolve(null),
+    ]);
 
     // 解析消息内容
     const { content, summary } = extractContent(msg);
@@ -264,6 +266,18 @@ async function main() {
                     continue;
                 }
 
+                // 消息年龄过滤：只转发 5 分钟内的消息，防止重启后重播历史
+                const MAX_AGE_MS = parseInt(process.env.MAX_MSG_AGE_MS || '300000', 10); // 默认 5 分钟
+                const msgAgeMs = msg.msgtime ? Date.now() - msg.msgtime : 0;
+                const isFresh = msgAgeMs < MAX_AGE_MS;
+                if (!isFresh) {
+                    log('INFO', 'msg_age_skip', {
+                        seq: msg.seq,
+                        ageSec: Math.round(msgAgeMs / 1000),
+                        reason: '历史消息（>5分钟），只存档不转发',
+                    });
+                }
+
                 const result = await processMessage(msg, nameResolver);
 
                 // DEBUG: 记录原始消息结构
@@ -282,12 +296,13 @@ async function main() {
 
                 // 存入 Supabase
                 if (result) {
-                    await saveMessage(result).catch(e =>
+                    // 存入 Supabase（fire-and-forget，不阻塞转发）
+                    saveMessage(result).catch(e =>
                         log('WARNING', 'supabase_save_failed', { message: e.message })
                     );
 
-                    // 仅处理外部用户发起的单聊消息（不含群聊、员工发起）
-                    if (result.direction === 'inbound' && !result.roomId) {
+                    // 仅处理外部用户发起的单聊消息（不含群聊、员工发起）且消息足够新
+                    if (result.direction === 'inbound' && !result.roomId && isFresh) {
 
                         // 确定转发内容
                         let itemContent  = result.content;  // 文本消息直接用
@@ -328,58 +343,33 @@ async function main() {
                             });
                         }
 
-                        if (itemContent) {
-                            const meta = {
+                        // 纯文件/图片/视频（无文字内容）：已提前下载，跳过 agent 转发
+                        if (isMediaOnly && !itemContent) {
+                            log('INFO', 'media_only_skip', {
+                                userId:  result.externalUserId,
+                                msgtype: result.msgtype,
+                                reason:  '纯媒体消息，无文字内容，跳过 agent',
+                            });
+                        } else if (itemContent) {
+                            // 立即转发，不经过防抖（skill-platform 有抢占机制处理连续消息）
+                            log('INFO', 'forward_immediate', {
+                                userId:  result.externalUserId,
+                                msgtype: result.msgtype,
+                                preview: itemContent.substring(0, 50),
+                            });
+                            const history = await getRecentHistory(result.externalUserId, 20)
+                                .catch(() => []);
+                            void forwardToSkillPlatform({
+                                content:          itemContent,
                                 externalUserId:   result.externalUserId,
                                 externalUserName: result.externalUserName,
                                 employeeUserId:   result.employeeUserId,
                                 employeeName:     result.employeeName,
-                                msgId:            result.msgid || '',  // 幂等键：企微消息 ID
-                            };
-
-                            // 防抖聚合：2s 内连发的消息合并后才触发转发
-                            enqueue(
-                                result.externalUserId,
-                                { content: itemContent, mediaUrl: itemMediaUrl, mediaOnly: isMediaOnly },
-                                meta,
-                                async (items, flushMeta) => {
-                                    // 纯文件批次（无文字/语音）：文件已下载，跳过 agent 转发
-                                    const hasTextOrVoice = items.some(i => !i.mediaOnly);
-                                    if (!hasTextOrVoice) {
-                                        log('INFO', 'debounce_file_only_skip', {
-                                            userId:    flushMeta.externalUserId,
-                                            count:     items.length,
-                                            types:     items.map(i => i.content?.split(']')[0]?.replace('[','') || 'file').join(','),
-                                            reason:    '纯文件消息批次，已提前下载，不触发 agent',
-                                        });
-                                        return;
-                                    }
-                                    // 合并多条内容（文件描述也附带，让 agent 知道发了文件）
-                                    const mediaCount = items.filter(i => i.mediaOnly).length;
-                                    const textCount  = items.filter(i => !i.mediaOnly).length;
-                                    const combined = items.map(i => i.content).join('\n');
-                                    log('INFO', 'debounce_flush_forward', {
-                                        userId:     flushMeta.externalUserId,
-                                        total:      items.length,
-                                        textCount,
-                                        mediaCount,
-                                        combined_preview: combined.substring(0, 80),
-                                    });
-
-                                    const history  = await getRecentHistory(flushMeta.externalUserId, 20)
-                                        .catch(() => []);
-                                    await forwardToSkillPlatform({
-                                        content:          combined,
-                                        externalUserId:   flushMeta.externalUserId,
-                                        externalUserName: flushMeta.externalUserName,
-                                        employeeUserId:   flushMeta.employeeUserId,
-                                        employeeName:     flushMeta.employeeName,
-                                        history,
-                                        msgId:            flushMeta.msgId || '',
-                                        msgtype:          'text',
-                                    });
-                                }
-                            );
+                                history,
+                                msgId:            result.msgid || '',
+                                // 语音消息 content 已是 STT 转写文字，以 text 发给 skill-platform
+                                msgtype:          (result.msgtype === 'voice') ? 'text' : (result.msgtype || 'text'),
+                            });
                         }
                     }
                 }
