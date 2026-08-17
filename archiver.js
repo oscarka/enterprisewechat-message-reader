@@ -344,12 +344,15 @@ async function main() {
                         }
 
                         // 判断是否需要立即转发给 agent：
+                        // ✅ 文字消息（text）→ 立即转发
                         // ✅ 语音转写成功 → 立即转发（用户"说话了"）
                         // ❌ 文件/图片（有无 AI摘要均不转发）→ 只暂存 URL 到 user_recent_files
                         //    等用户主动发文字才触发 agent，届时文件自动挂载到工单
                         const isFileOrImage = result.msgtype === 'file' || result.msgtype === 'image';
+                        const isTextMessage = result.msgtype === 'text';
                         const hasMeaningfulContent = !!itemContent && (
-                            result.msgtype === 'voice'              // 语音已转写 → 立即触发
+                            isTextMessage                           // 文字消息 → 立即触发
+                            || result.msgtype === 'voice'           // 语音已转写 → 立即触发
                         );
 
                         // 先把文件/图片的 AI摘要内容通过 ingest 保存到 user_recent_files，但不触发 agent
@@ -384,7 +387,7 @@ async function main() {
                             });
                         } else if (hasMeaningfulContent) {
 
-                            // 语音转写成功 → 立即转发
+                            // 文字消息或语音转写成功 → 立即转发
                             log('INFO', 'forward_immediate', {
                                 userId:  result.externalUserId,
                                 msgtype: result.msgtype,
@@ -408,6 +411,7 @@ async function main() {
                             });
 
                         }
+
 
                     }
                 }
