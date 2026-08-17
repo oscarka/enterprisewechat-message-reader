@@ -343,14 +343,28 @@ async function main() {
                             });
                         }
 
-                        // 纯文件/图片/视频（无文字内容）：已提前下载，跳过 agent 转发
-                        if (isMediaOnly && !itemContent) {
+                        // 判断 itemContent 是否有实质内容（可供 Agent 处理的内容）
+                        // PDF 规则：
+                        //   - 含 AI摘要（文字型PDF已成功提取）→ 转发给 agent
+                        //   - 扫描件/占位文本（无 AI摘要）→ 只记录不转发；文件 URL 已通过 ingest 的 media_url 暂存到 user_recent_files
+                        // 语音：转写成功 → 转发
+                        // 图片：如有实质描述 → 转发；否则只记录
+                        const hasMeaningfulContent = !!itemContent && (
+                            itemContent.includes('AI摘要:')        // PDF 文字提取成功
+                            || result.msgtype === 'voice'           // 语音已转写
+                            || (result.msgtype === 'image' && !itemContent.startsWith('[图片'))
+                        );
+
+                        // 纯文件/图片/视频（无实质内容）：已提前下载/暂存，跳过 agent 转发
+                        if (isMediaOnly && !hasMeaningfulContent) {
                             log('INFO', 'media_only_skip', {
                                 userId:  result.externalUserId,
                                 msgtype: result.msgtype,
-                                reason:  '纯媒体消息，无文字内容，跳过 agent',
+                                reason:  '纯媒体消息（扫描件/无摘要），已暂存到 user_recent_files，等用户发文字再触发 agent',
+                                contentPreview: (itemContent || '').slice(0, 60),
                             });
-                        } else if (itemContent) {
+                        } else if (hasMeaningfulContent) {
+
                             // 立即转发，不经过防抖（skill-platform 有抢占机制处理连续消息）
                             log('INFO', 'forward_immediate', {
                                 userId:  result.externalUserId,
