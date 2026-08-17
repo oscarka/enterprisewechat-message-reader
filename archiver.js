@@ -343,29 +343,48 @@ async function main() {
                             });
                         }
 
-                        // 判断 itemContent 是否有实质内容（可供 Agent 处理的内容）
-                        // PDF 规则：
-                        //   - 含 AI摘要（文字型PDF已成功提取）→ 转发给 agent
-                        //   - 扫描件/占位文本（无 AI摘要）→ 只记录不转发；文件 URL 已通过 ingest 的 media_url 暂存到 user_recent_files
-                        // 语音：转写成功 → 转发
-                        // 图片：如有实质描述 → 转发；否则只记录
+                        // 判断是否需要立即转发给 agent：
+                        // ✅ 语音转写成功 → 立即转发（用户"说话了"）
+                        // ❌ 文件/图片（有无 AI摘要均不转发）→ 只暂存 URL 到 user_recent_files
+                        //    等用户主动发文字才触发 agent，届时文件自动挂载到工单
+                        const isFileOrImage = result.msgtype === 'file' || result.msgtype === 'image';
                         const hasMeaningfulContent = !!itemContent && (
-                            itemContent.includes('AI摘要:')        // PDF 文字提取成功
-                            || result.msgtype === 'voice'           // 语音已转写
-                            || (result.msgtype === 'image' && !itemContent.startsWith('[图片'))
+                            result.msgtype === 'voice'              // 语音已转写 → 立即触发
                         );
 
-                        // 纯文件/图片/视频（无实质内容）：已提前下载/暂存，跳过 agent 转发
-                        if (isMediaOnly && !hasMeaningfulContent) {
+                        // 先把文件/图片的 AI摘要内容通过 ingest 保存到 user_recent_files，但不触发 agent
+                        if (isFileOrImage && itemContent && itemContent.includes('AI摘要:')) {
+                            // 有实质 AI摘要：调 ingest 保存（ingest 端会检测 isFileOnlyContent=true，只暂存不触发 agent）
+                            log('INFO', 'media_aisum_save', {
+                                userId:  result.externalUserId,
+                                msgtype: result.msgtype,
+                                reason:  '文件/图片已生成AI摘要，通过ingest暂存，等用户发文字再触发agent',
+                                preview: itemContent.slice(0, 80),
+                            });
+                            const history = await getRecentHistory(result.externalUserId, 20).catch(() => []);
+                            void forwardToSkillPlatform({
+                                content:          itemContent,
+                                externalUserId:   result.externalUserId,
+                                externalUserName: result.externalUserName,
+                                employeeUserId:   result.employeeUserId,
+                                employeeName:     result.employeeName,
+                                history,
+                                msgId:            result.msgid || '',
+                                msgtype:          result.msgtype || 'file',
+                                mediaUrl:         itemMediaUrl || null,
+                                fileName:         msg.file?.filename || null,
+                                fileType:         result.msgtype || null,
+                            });
+                        } else if (isMediaOnly && !hasMeaningfulContent) {
                             log('INFO', 'media_only_skip', {
                                 userId:  result.externalUserId,
                                 msgtype: result.msgtype,
-                                reason:  '纯媒体消息（扫描件/无摘要），已暂存到 user_recent_files，等用户发文字再触发 agent',
+                                reason:  '纯媒体消息（无有效摘要），已暂存 URL 到 user_recent_files，等用户发文字再触发 agent',
                                 contentPreview: (itemContent || '').slice(0, 60),
                             });
                         } else if (hasMeaningfulContent) {
 
-                            // 立即转发，不经过防抖（skill-platform 有抢占机制处理连续消息）
+                            // 语音转写成功 → 立即转发
                             log('INFO', 'forward_immediate', {
                                 userId:  result.externalUserId,
                                 msgtype: result.msgtype,
@@ -382,7 +401,6 @@ async function main() {
                                 employeeName:     result.employeeName,
                                 history,
                                 msgId:            result.msgid || '',
-                                // 语音消息 content 已是 STT 转写文字，以 text 发给 skill-platform
                                 msgtype:          (result.msgtype === 'voice') ? 'text' : (result.msgtype || 'text'),
                                 mediaUrl:         itemMediaUrl || null,
                                 fileName:         fileName || null,
@@ -390,6 +408,7 @@ async function main() {
                             });
 
                         }
+
                     }
                 }
 

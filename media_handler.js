@@ -119,6 +119,43 @@ async function _summarizeDocument(text, filename) {
     }
 }
 
+// ─── Gemini Vision OCR：扫描件/图片 PDF ─────────────────────────────────────
+// Gemini 2.5 Flash 原生支持 PDF，可直接 base64 发送识别
+
+async function _ocrPdfWithGemini(buffer, gcsUrl, filename) {
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) return null;
+    try {
+        const ai = new GoogleGenAI({ apiKey });
+
+        let pdfPart;
+        if (buffer.length <= INLINE_MAX_BYTES) {
+            // 小文件（≤14MB）：base64 直接内嵌
+            pdfPart = { inlineData: { mimeType: 'application/pdf', data: buffer.toString('base64') } };
+        } else {
+            // 大文件：用 GCS URI
+            _log('pdf_ocr_use_url', { sizeKB: Math.round(buffer.length / 1024), gcsUrl });
+            pdfPart = { fileData: { mimeType: 'application/pdf', fileUri: gcsUrl } };
+        }
+
+        const resp = await ai.models.generateContent({
+            model: 'gemini-2.5-flash',   // flash-lite 对多页 PDF 可能力度不够
+            contents: [{
+                parts: [
+                    { text: `请仔细阅读这份PDF文档（文件名：${filename}），用3-5句话概括主要内容和关键数据指标（如有异常值请特别指出），直接输出摘要，不要解释：` },
+                    pdfPart,
+                ],
+            }],
+        });
+        const summary = (resp.text || '').trim();
+        _log('pdf_ocr_success', { filename, summaryLen: summary.length, preview: summary.slice(0, 80) });
+        return summary || null;
+    } catch (e) {
+        _log('pdf_ocr_error', { message: e.message, filename });
+        return null;
+    }
+}
+
 // ─── 火山引擎大模型 ASR（首选，速度快准确率高）──────────────────────────────
 
 async function _transcribeWithVolcano(buffer) {
@@ -312,21 +349,39 @@ async function handleMedia(sdk, msg) {
         } else if (msg.msgtype === 'file') {
             const filename = msg.file?.filename || '未知文件';
             const ext = (filename.split('.').pop() || '').toLowerCase();
-            if (pdfParse && ext === 'pdf') {
+            if (ext === 'pdf') {
                 try {
-                    const pdfData = await pdfParse(buffer);
-                    const rawText = (pdfData.text || '').trim();
+                    // 第一步：用 pdf-parse 提取文字层（文字型 PDF，速度快）
+                    let rawText = '';
+                    if (pdfParse) {
+                        try {
+                            const pdfData = await pdfParse(buffer);
+                            rawText = (pdfData.text || '').trim();
+                        } catch (parseErr) {
+                            _log('pdf_parse_error', { message: parseErr.message, filename });
+                        }
+                    }
+
                     if (rawText) {
+                        // 文字型 PDF：直接文本摘要
                         const summary = await _summarizeDocument(rawText, filename);
                         content = `[文件: ${filename} | AI摘要: ${summary}]`;
                         _log('pdf_extracted', { filename, chars: rawText.length, summaryLen: summary.length });
                     } else {
-                        content = `[文件: ${filename}（扫描件/图片PDF，无可提取文字）]`;
-                        _log('pdf_no_text', { filename });
+                        // 扫描件/图片 PDF：Gemini Vision OCR 兜底
+                        _log('pdf_no_text_try_ocr', { filename, reason: '无文字层，尝试 Gemini Vision OCR' });
+                        const ocrSummary = await _ocrPdfWithGemini(buffer, mediaUrl, filename);
+                        if (ocrSummary) {
+                            content = `[文件: ${filename} | AI摘要: ${ocrSummary}]`;
+                            _log('pdf_ocr_done', { filename });
+                        } else {
+                            content = `[文件: ${filename}（扫描件，OCR 未能提取内容）]`;
+                            _log('pdf_ocr_fallback', { filename });
+                        }
                     }
                 } catch (e) {
-                    _log('pdf_parse_error', { message: e.message, filename });
-                    content = `[文件: ${filename}（PDF解析失败）]`;
+                    _log('pdf_handle_error', { message: e.message, filename });
+                    content = `[文件: ${filename}（PDF处理失败）]`;
                 }
             } else {
                 // 非 PDF：存文件名，供 agent 了解有文件存在
