@@ -359,6 +359,7 @@ async function main() {
                             });
                             const history = await getRecentHistory(result.externalUserId, 20)
                                 .catch(() => []);
+                            const fileName = msg.file?.filename || (result.msgtype === 'image' ? '图片.jpg' : '');
                             void forwardToSkillPlatform({
                                 content:          itemContent,
                                 externalUserId:   result.externalUserId,
@@ -369,7 +370,11 @@ async function main() {
                                 msgId:            result.msgid || '',
                                 // 语音消息 content 已是 STT 转写文字，以 text 发给 skill-platform
                                 msgtype:          (result.msgtype === 'voice') ? 'text' : (result.msgtype || 'text'),
+                                mediaUrl:         itemMediaUrl || null,
+                                fileName:         fileName || null,
+                                fileType:         result.msgtype || null,
                             });
+
                         }
                     }
                 }

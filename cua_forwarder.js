@@ -130,7 +130,7 @@ async function forwardToSkillPlatform(opts) {
         return;
     }
 
-    const { content, externalUserId, externalUserName, employeeUserId, employeeName, history, msgId, msgtype } = opts;
+    const { content, externalUserId, externalUserName, employeeUserId, employeeName, history, msgId, msgtype, mediaUrl, fileName, fileType } = opts;
 
     const body = {
         from_name:       externalUserName || externalUserId,
@@ -143,7 +143,11 @@ async function forwardToSkillPlatform(opts) {
         employee_name:   employeeName,
         history:         history || [],
         idempotency_key: msgId || '',
+        media_url:       mediaUrl || null,
+        file_name:       fileName || null,
+        file_type:       fileType || null,
     };
+
 
     const url = SKILL_PLATFORM_URL.replace(/\/?$/, '') + '/api/orch/ingest';
 
