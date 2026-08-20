@@ -356,9 +356,9 @@ async function main() {
                             || result.msgtype === 'voice'           // 语音已转写 → 立即触发
                         );
 
-                        // 先把文件/图片的 AI摘要内容通过 ingest 保存到 user_recent_files，但不触发 agent
-                        if (isFileOrImage && itemContent && itemContent.includes('AI摘要:')) {
-                            // 有实质 AI摘要：调 ingest 保存（ingest 端会检测 isFileOnlyContent=true，只暂存不触发 agent）
+                        // 先把文件/图片的 AI摘要或图片描述内容通过 ingest 保存到 user_recent_files，但不触发 agent
+                        if (isFileOrImage && itemContent && (itemContent.includes('AI摘要:') || itemContent.startsWith('[图片:') || itemContent.startsWith('[文件:'))) {
+                            // 有实质描述/摘要：调 ingest 保存（ingest 端会检测 isFileOnlyContent=true，只暂存不触发 agent）
                             log('INFO', 'media_aisum_save', {
                                 userId:  result.externalUserId,
                                 msgtype: result.msgtype,

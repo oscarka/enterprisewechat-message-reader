@@ -86,6 +86,7 @@ async function getRecentHistory(externalUserId, limit = 20) {
                  msgtype = 'text'
                  OR (msgtype = 'voice' AND content != '')
                  OR (msgtype = 'file'  AND content != '')
+                 OR (msgtype = 'image' AND content != '')
                )
                AND content IS NOT NULL
                AND content != ''
