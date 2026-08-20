@@ -130,11 +130,12 @@ async function forwardToSkillPlatform(opts) {
         return;
     }
 
-    const { content, externalUserId, externalUserName, employeeUserId, employeeName, history, msgId, msgtype, mediaUrl, fileName, fileType } = opts;
+    const { content, externalUserId, externalUserName, employeeUserId, employeeName, history, msgId, msgtype, mediaUrl, fileName, fileType, unionid } = opts;
 
     const body = {
         from_name:       externalUserName || externalUserId,
         from_user_id:    externalUserId,
+        unionid:         unionid || null,   // 跨平台唯一 ID，用于 wecom/juhe 身份合并
         content,
         msgtype:         msgtype || 'text',
         channel:         'wecom',

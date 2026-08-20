@@ -86,6 +86,7 @@ class NameResolver {
                     wechatName:  contact.name,
                     remark,
                     isEmployee:  false,
+                    unionid:     contact.unionid || null,   // 跨平台唯一 ID，用于 wecom/juhe 身份合并
                     expireAt:    Date.now() + NAME_CACHE_TTL_MS,
                 };
                 this._nameCache.set(userId, result);

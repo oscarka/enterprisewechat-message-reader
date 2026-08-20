@@ -163,6 +163,7 @@ async function processMessage(msg, nameResolver) {
         seq:              seq || seqFallback,
         externalUserId:   extUserId,
         externalUserName: extUserName,
+        externalUnionid:  isInbound ? (fromName.unionid || null) : null,  // 外部用户 unionid
         employeeUserId:   empUserId,
         employeeName:     empName,
         direction:        isInbound ? 'inbound' : 'outbound',
@@ -369,6 +370,7 @@ async function main() {
                                 content:          itemContent,
                                 externalUserId:   result.externalUserId,
                                 externalUserName: result.externalUserName,
+                                unionid:          result.externalUnionid || null,
                                 employeeUserId:   result.employeeUserId,
                                 employeeName:     result.employeeName,
                                 history,
@@ -400,6 +402,7 @@ async function main() {
                                 content:          itemContent,
                                 externalUserId:   result.externalUserId,
                                 externalUserName: result.externalUserName,
+                                unionid:          result.externalUnionid || null,
                                 employeeUserId:   result.employeeUserId,
                                 employeeName:     result.employeeName,
                                 history,
