@@ -22,6 +22,47 @@ function _log(type, extra = {}) {
     console.log(JSON.stringify({ severity: 'INFO', type, ...extra, ts: new Date().toISOString() }));
 }
 
+// ─── 跨模块图片等待通知 ──────────────────────────────────────────────────────
+// archiver.js 图片开始下载时调 registerPendingMedia，OCR 完成后调 resolve(content)
+// forward_immediate 路径调 waitForPendingMedia 等待并拿到 OCR 内容
+const _pendingMediaPromises = new Map();  // userId → { promise, resolve(content) }
+
+/**
+ * archiver.js 调用：图片开始 OCR，注册等待
+ * @returns {Function} done(content) — OCR 完成后调用，传入 OCR 文本（失败传 null）
+ */
+function registerPendingMedia(userId) {
+    let _resolve;
+    const promise = new Promise(r => { _resolve = r; });
+    _pendingMediaPromises.set(userId, promise);
+    return (content) => {
+        _pendingMediaPromises.delete(userId);
+        _resolve(content || null);  // 把 OCR 内容传给等待方
+    };
+}
+
+/**
+ * archiver.js forward_immediate 调用：等待该用户的图片 OCR（如有），返回 OCR 内容
+ * 无 pending 图片时立即返回 null；有则等待最多 maxMs 毫秒
+ * @returns {Promise<string|null>}
+ */
+async function waitForPendingMedia(userId, maxMs = 15_000) {
+    const promise = _pendingMediaPromises.get(userId);
+    if (!promise) return null;
+    _log('media_wait_start', { userId, maxMs });
+    const content = await Promise.race([
+        promise,
+        new Promise(r => setTimeout(() => r(null), maxMs)),
+    ]);
+    _log('media_wait_done', { userId, hasContent: !!content });
+    return content;
+}
+
+/**
+ * 兼容旧接口（no-op，功能已由 registerPendingMedia 返回的 done fn 承担）
+ */
+function notifyMediaReady(userId) {}
+
 /**
  * 调用 Gemini Flash Lite 判断消息是否完整（宽松）
  * 单条 ≤20 字的消息直接返回 true，不消耗 API 配额
@@ -136,11 +177,17 @@ function enqueue(userId, item, meta, callback) {
         });
         const complete = await _isComplete(contents);
         if (complete) {
+            // ── 图片等待：若该用户有正在 OCR 的图片，先等它完成（最多 15s）──
+            const mediaPromise = _pendingMediaPromises.get(userId);
+            if (mediaPromise) {
+                _log('debounce_waiting_media', { userId, reason: '有图片正在 OCR，等待完成后再 flush（最多 15s）' });
+                await Promise.race([mediaPromise, new Promise(r => setTimeout(r, 15_000))]);
+                _log('debounce_media_wait_done', { userId });
+            }
             _log('debounce_soft_flush', { userId, reason: '软定时器触发 + 判断完整，立即 flush' });
             _flush(userId, callback);
         } else {
             _log('debounce_waiting', { userId, reason: 'AI判断未完整，等待硬定时器兜底', hardMs: HARD_MS });
-            // 软定时器触发但未完整，等硬定时器兜底
         }
     }, SOFT_MS);
 
@@ -158,4 +205,4 @@ function enqueue(userId, item, meta, callback) {
     }
 }
 
-module.exports = { enqueue };
+module.exports = { enqueue, registerPendingMedia, waitForPendingMedia, notifyMediaReady };

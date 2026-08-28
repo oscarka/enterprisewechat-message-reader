@@ -64,8 +64,6 @@ async function _uploadToGCS(buffer, filename, contentType) {
     return `https://storage.googleapis.com/${MEDIA_BUCKET}/${filename}`;
 }
 
-// ─── Gemini Vision 图片描述 ───────────────────────────────────────────────────
-
 async function _describeImage(buffer, gcsUrl) {
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) return '[图片]';
@@ -75,24 +73,61 @@ async function _describeImage(buffer, gcsUrl) {
 
         let part;
         if (buffer.length <= INLINE_MAX_BYTES) {
-            // 小图：base64 直接内嵌
             part = { inlineData: { mimeType: 'image/jpeg', data: buffer.toString('base64') } };
         } else {
-            // 大图（> 14MB）：用 GCS 公开 URL 引用
             _log('image_use_url', { sizeKB: Math.round(buffer.length / 1024), gcsUrl });
             part = { fileData: { mimeType: 'image/jpeg', fileUri: gcsUrl } };
         }
 
-        const resp = await ai.models.generateContent({
+        // ── 第一步：判断图片类型 ──────────────────────────────────────────────
+        const classifyResp = await ai.models.generateContent({
             model: 'gemini-2.5-flash-lite',
             contents: [{
                 parts: [
-                    { text: '请用1-2句话简洁描述这张图片的主要内容（直接描述，不要解释）：' },
+                    { text: '这张图片属于哪种类型？只回答一个词：文档、报告、截图、照片。（文档=合同/证件/表格，报告=检验/化验/检查报告，截图=手机/电脑截图含文字，照片=人物/风景/产品等）' },
                     part,
                 ],
             }],
         });
-        return (resp.text || '').trim() || '[图片]';
+        const imgType = (classifyResp.text || '').trim();
+        _log('image_classify', { type: imgType, sizeKB: Math.round(buffer.length / 1024) });
+
+        // ── 第二步：根据类型选择不同处理策略 ────────────────────────────────
+        const isTextHeavy = /文档|报告|截图/.test(imgType);
+
+        let prompt;
+        if (isTextHeavy) {
+            // 文字密集型：全量 OCR，保留所有数值和结构
+            prompt = `请对这张图片做完整的文字识别（OCR），提取所有可见的文字内容。
+要求：
+1. 逐行保留所有数字、指标名称、参考范围、单位
+2. 保留表格结构（用竖线分隔列）
+3. 保留所有标注（如箭头↑↓、H/L标记）
+4. 不要总结，不要省略，原样输出所有文字
+格式：[图片内容:\n（完整OCR文字）]`;
+        } else {
+            // 普通图片：简洁描述
+            prompt = '请用1-3句话描述这张图片的主要内容（直接描述，不要解释）：';
+        }
+
+        const resp = await ai.models.generateContent({
+            model: 'gemini-2.5-flash',   // 文字类用更强的模型
+            contents: [{
+                parts: [
+                    { text: prompt },
+                    part,
+                ],
+            }],
+            config: isTextHeavy ? { thinkingConfig: { thinkingBudget: 0 } } : undefined,
+        });
+
+        const text = (resp.text || '').trim() || '[图片]';
+        if (isTextHeavy) {
+            // 包装成统一格式
+            return text.startsWith('[图片') ? text : `[图片内容:\n${text}]`;
+        }
+        return `[图片: ${text}]`;
+
     } catch (e) {
         _log('vision_error', { message: e.message });
         return '[图片]';

@@ -27,7 +27,9 @@ const NameResolver  = require('./name_resolver');
 const SeqStore      = require('./seq_store');
 const { initSchema, saveMessage, getRecentHistory, updateMessageContent } = require('./supabase_store');
 const { forwardToCua, forwardToSkillPlatform } = require('./cua_forwarder');
-const { enqueue }      = require('./message_debouncer');
+const { createAndRunMediaTask } = require('./media_task_manager');
+const { enqueueText, touchMediaQueue, tryFlush } = require('./inbound_queue');
+
 const { handleMedia }  = require('./media_handler');
 
 // 需要尝试下载媒体的消息类型
@@ -164,6 +166,7 @@ async function processMessage(msg, nameResolver) {
         externalUserId:   extUserId,
         externalUserName: extUserName,
         externalUnionid:  isInbound ? (fromName.unionid || null) : null,  // 外部用户 unionid
+        externalAvatar:   isInbound ? (fromName.avatar  || null) : null,  // 外部用户头像 URL
         employeeUserId:   empUserId,
         employeeName:     empName,
         direction:        isInbound ? 'inbound' : 'outbound',
@@ -257,6 +260,7 @@ async function main() {
             });
 
             // 处理每条消息
+            const affectedUserIds = new Set();
             for (const msgStr of ret.data) {
                 if (!msgStr) continue;
                 let msg;
@@ -305,116 +309,82 @@ async function main() {
                     // 仅处理外部用户发起的单聊消息（不含群聊、员工发起）且消息足够新
                     if (result.direction === 'inbound' && !result.roomId && isFresh) {
 
-                        // 确定转发内容
-                        let itemContent  = result.content;  // 文本消息直接用
-                        let itemMediaUrl = null;
+                        const meta = {
+                            externalUserId:   result.externalUserId,
+                            externalUserName: result.externalUserName,
+                            unionid:          result.externalUnionid || null,
+                            avatar:           result.externalAvatar  || null,
+                            employeeUserId:   result.employeeUserId,
+                            employeeName:     result.employeeName,
+                            msgId:            result.msgid || '',
+                            msgtype:          result.msgtype,
+                        };
 
-                        // 非语音媒体（图片/视频/文件）标记 mediaOnly，flush 时若仍无内容则静默
-                        // 注意：PDF 提取成功后会重置 isMediaOnly = false，确保 agent 能收到
-                        let isMediaOnly = MEDIA_TYPES.has(result.msgtype) && result.msgtype !== 'voice';
-                        if (MEDIA_TYPES.has(result.msgtype)) {
-                            // 媒体消息：立即下载（不等 flush，节省后续处理时间）
-                            log('INFO', 'media_eager_download', {
-                                userId:    result.externalUserId,
-                                msgtype:   result.msgtype,
+                        const handleQueueFlush = async ({ content, userId, meta, isMediaOnly, tasks, texts }) => {
+                            const history = await getRecentHistory(userId, 20).catch(() => []);
+                            const firstTask = tasks[0];
+                            const attachments = tasks.map(t => ({
+                                fileName: t.fileName,
+                                fileUrl:  t.fileUrl,
+                                msgtype:  t.msgtype,
+                                summary:  t.extractedText,
+                                status:   t.status,
+                            }));
+
+                            log('INFO', 'inbound_forward_dispatch', {
+                                userId,
                                 isMediaOnly,
-                                reason:    isMediaOnly
-                                    ? '立即下载，标记 mediaOnly（flush 时若无文字/语音则静默）'
-                                    : '语音消息，立即下载 + 进入防抖队列',
+                                textCount: texts.length,
+                                mediaCount: tasks.length,
+                                contentPreview: content.slice(0, 80),
                             });
-                            const mediaResult = await handleMedia(sdk, msg).catch(e => {
-                                log('WARNING', 'media_handle_failed', { message: e.message });
-                                return { content: `[${result.msgtype}]`, mediaUrl: null };
-                            });
-                            itemContent  = mediaResult.content;
-                            itemMediaUrl = mediaResult.mediaUrl;
-                            // 将 AI 分析结果存回 Supabase（确保语音转写/图片描述进入历史）
-                            if (itemContent && result.msgid) {
-                                await updateMessageContent(result.msgid, itemContent).catch(() => {});
-                            }
-                            // PDF 成功提取内容 → 视为有价值消息，取消 file-only skip
-                            if (result.msgtype === 'file' && itemContent && itemContent.includes('AI摘要:')) {
-                                isMediaOnly = false;
-                            }
-                            log('INFO', 'media_download_done', {
-                                userId:   result.externalUserId,
-                                msgtype:  result.msgtype,
-                                content:  (itemContent || '').substring(0, 50),
-                                hasUrl:   !!itemMediaUrl,
-                            });
-                        }
 
-                        // 判断是否需要立即转发给 agent：
-                        // ✅ 文字消息（text）→ 立即转发
-                        // ✅ 语音转写成功 → 立即转发（用户"说话了"）
-                        // ❌ 文件/图片（有无 AI摘要均不转发）→ 只暂存 URL 到 user_recent_files
-                        //    等用户主动发文字才触发 agent，届时文件自动挂载到工单
-                        const isFileOrImage = result.msgtype === 'file' || result.msgtype === 'image';
-                        const isTextMessage = result.msgtype === 'text';
-                        const hasMeaningfulContent = !!itemContent && (
-                            isTextMessage                           // 文字消息 → 立即触发
-                            || result.msgtype === 'voice'           // 语音已转写 → 立即触发
-                        );
-
-                        // 先把文件/图片的 AI摘要或图片描述内容通过 ingest 保存到 user_recent_files，但不触发 agent
-                        if (isFileOrImage && itemContent && (itemContent.includes('AI摘要:') || itemContent.startsWith('[图片:') || itemContent.startsWith('[文件:'))) {
-                            // 有实质描述/摘要：调 ingest 保存（ingest 端会检测 isFileOnlyContent=true，只暂存不触发 agent）
-                            log('INFO', 'media_aisum_save', {
-                                userId:  result.externalUserId,
-                                msgtype: result.msgtype,
-                                reason:  '文件/图片已生成AI摘要，通过ingest暂存，等用户发文字再触发agent',
-                                preview: itemContent.slice(0, 80),
-                            });
-                            const history = await getRecentHistory(result.externalUserId, 20).catch(() => []);
                             void forwardToSkillPlatform({
-                                content:          itemContent,
-                                externalUserId:   result.externalUserId,
-                                externalUserName: result.externalUserName,
-                                unionid:          result.externalUnionid || null,
-                                employeeUserId:   result.employeeUserId,
-                                employeeName:     result.employeeName,
+                                content,
+                                externalUserId:   meta.externalUserId,
+                                externalUserName: meta.externalUserName,
+                                unionid:          meta.unionid,
+                                avatar:           meta.avatar,
+                                employeeUserId:   meta.employeeUserId,
+                                employeeName:     meta.employeeName,
                                 history,
-                                msgId:            result.msgid || '',
-                                msgtype:          result.msgtype || 'file',
-                                mediaUrl:         itemMediaUrl || null,
-                                fileName:         msg.file?.filename || null,
-                                fileType:         result.msgtype || null,
+                                msgId:            meta.msgId,
+                                msgtype:          isMediaOnly ? (firstTask?.msgtype || 'image') : 'text',
+                                mediaUrl:         firstTask?.fileUrl || null,
+                                fileName:         firstTask?.fileName || null,
+                                fileType:         firstTask?.msgtype || null,
+                                attachments,
                             });
-                        } else if (isMediaOnly && !hasMeaningfulContent) {
-                            log('INFO', 'media_only_skip', {
-                                userId:  result.externalUserId,
-                                msgtype: result.msgtype,
-                                reason:  '纯媒体消息（无有效摘要），已暂存 URL 到 user_recent_files，等用户发文字再触发 agent',
-                                contentPreview: (itemContent || '').slice(0, 60),
-                            });
-                        } else if (hasMeaningfulContent) {
+                        };
 
-                            // 文字消息或语音转写成功 → 立即转发
-                            log('INFO', 'forward_immediate', {
-                                userId:  result.externalUserId,
-                                msgtype: result.msgtype,
-                                preview: itemContent.substring(0, 50),
-                            });
-                            const history = await getRecentHistory(result.externalUserId, 20)
-                                .catch(() => []);
-                            const fileName = msg.file?.filename || (result.msgtype === 'image' ? '图片.jpg' : '');
-                            void forwardToSkillPlatform({
-                                content:          itemContent,
-                                externalUserId:   result.externalUserId,
-                                externalUserName: result.externalUserName,
-                                unionid:          result.externalUnionid || null,
-                                employeeUserId:   result.employeeUserId,
-                                employeeName:     result.employeeName,
-                                history,
-                                msgId:            result.msgid || '',
-                                msgtype:          (result.msgtype === 'voice') ? 'text' : (result.msgtype || 'text'),
-                                mediaUrl:         itemMediaUrl || null,
-                                fileName:         fileName || null,
-                                fileType:         result.msgtype || null,
-                            });
-
+                        if (MEDIA_TYPES.has(result.msgtype)) {
+                            const fileName = msg.file?.filename || (result.msgtype === 'image' ? '图片.jpg' : '附件');
+                            // 异步启动媒体下载与解析任务，不阻塞轮询主循环
+                            createAndRunMediaTask(
+                                result.externalUserId,
+                                result.msgid,
+                                result.msgtype,
+                                fileName,
+                                async () => {
+                                    const mediaRes = await handleMedia(sdk, msg);
+                                    if (mediaRes?.content && result.msgid) {
+                                        await updateMessageContent(result.msgid, mediaRes.content).catch(() => {});
+                                    }
+                                    return mediaRes;
+                                }
+                            );
+                            touchMediaQueue(result.externalUserId, meta, handleQueueFlush);
+                            affectedUserIds.add(result.externalUserId);
+                        } else if (result.content) {
+                            // 纯文本消息：直接加入用户待发队列
+                            enqueueText(
+                                result.externalUserId,
+                                { content: result.content, msgId: result.msgid },
+                                meta,
+                                handleQueueFlush
+                            );
+                            affectedUserIds.add(result.externalUserId);
                         }
-
 
                     }
                 }
@@ -422,6 +392,11 @@ async function main() {
                 if (msg.seq && msg.seq > currentSeq) {
                     currentSeq = msg.seq;
                 }
+            }
+
+            // 批次全量注册完成后，对本批次涉及的用户统一触发一次出队判定（彻底杜绝批次内先后顺序导致的抢跑）
+            for (const uid of affectedUserIds) {
+                tryFlush(uid);
             }
 
             // 更新 seq

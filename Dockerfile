@@ -15,6 +15,8 @@ COPY name_resolver.js .
 COPY seq_store.js .
 COPY supabase_store.js .
 COPY cua_forwarder.js .
+COPY media_task_manager.js .
+COPY inbound_queue.js .
 COPY message_debouncer.js .
 COPY media_handler.js .
 COPY diagnose_archiving.js .

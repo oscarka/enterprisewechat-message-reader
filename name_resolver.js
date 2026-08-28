@@ -87,6 +87,7 @@ class NameResolver {
                     remark,
                     isEmployee:  false,
                     unionid:     contact.unionid || null,   // 跨平台唯一 ID，用于 wecom/juhe 身份合并
+                    avatar:      contact.avatar  || null,   // 头像 URL，用于跨渠道身份匹配
                     expireAt:    Date.now() + NAME_CACHE_TTL_MS,
                 };
                 this._nameCache.set(userId, result);
