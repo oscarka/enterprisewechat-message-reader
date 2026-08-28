@@ -140,6 +140,7 @@ async function forwardToSkillPlatform(opts) {
         content,
         msgtype:         msgtype || 'text',
         channel:         'wecom',
+        agent_id:        process.env.ACTIVE_AGENT_ID || 'health-advisor',
         conversation_id: externalUserId,
         employee_id:     employeeUserId,
         employee_name:   employeeName,
