@@ -49,15 +49,11 @@ function sleep(ms) {
     return new Promise(r => setTimeout(r, ms));
 }
 
-// ─── Cloud Run 健康检查服务器 ──────────────────────────────────
-// Cloud Run 要求容器在启动时监听指定端口，否则 startup probe 会超时
+// ─── 统一 HTTP 网关 (Cloud Run 探针 + MiniHealth 问答接入) ────────
+const { createHttpServer } = require('./http_gateway');
 const PORT = parseInt(process.env.PORT || '8080', 10);
-http.createServer((req, res) => {
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('OK');
-}).listen(PORT, () => {
-    log('INFO', 'health_server', { message: `健康检查服务器已启动，监听端口 ${PORT}` });
-});
+createHttpServer(PORT);
+
 
 
 // ─── 消息内容摘要 ─────────────────────────────────────────────

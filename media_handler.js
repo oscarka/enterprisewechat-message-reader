@@ -439,4 +439,203 @@ async function handleMedia(sdk, msg) {
     }
 }
 
-module.exports = { handleMedia };
+// ─── 拍照识餐：豆包 Vision (食材解构) + DeepSeek V4 Flash (代谢测算) ────────────
+
+async function _analyzeMealWithDoubaoAndDeepseek(buffer, meta = {}) {
+    const arkKey = process.env.DOUBAO_API_KEY || process.env.ARK_API_KEY;
+    const arkBase = process.env.DOUBAO_BASE_URL || 'https://ark.cn-beijing.volces.com/api/v3';
+    const axios = require('axios');
+
+    if (!arkKey) {
+        _log('meal_analyze_no_key', { reason: '未配置 ARK_API_KEY/DOUBAO_API_KEY，降级至 Gemini 描述' });
+        const desc = await _describeImage(buffer, null);
+        return `[餐食: ${desc}]`;
+    }
+
+    try {
+        const base64Img = buffer.toString('base64');
+
+        // 步骤 1：调用多模态模型解构食材
+        const visionModel = process.env.DOUBAO_VISION_MODEL || process.env.ARK_MODEL || 'deepseek-v4-flash-ga-260731';
+        const visionResp = await axios.post(
+            `${arkBase}/chat/completions`,
+            {
+                model: visionModel,
+                messages: [
+                    {
+                        role: 'user',
+                        content: [
+                            {
+                                type: 'text',
+                                text: '你是资深中式食材解构师。请识别图片中的全部菜品与主食，只输出观察事实，以纯 JSON 格式输出：\n{\n  "dish_name": "主要菜品名称",\n  "cooking_method": "烹饪方式(如清蒸/少油炒/红烧/油炸)",\n  "ingredients": [\n    { "name": "食材名称", "weight_g": 预估熟重克数 }\n  ],\n  "notes": "口味特征(如清淡/多油/高钠/加糖)"\n}\n只输出纯 JSON，严禁任何额外文本或 Markdown 标记。',
+                            },
+                            {
+                                type: 'image_url',
+                                image_url: { url: `data:image/jpeg;base64,${base64Img}` },
+                            },
+                        ],
+                    },
+                ],
+                temperature: 0.1,
+            },
+            {
+                headers: {
+                    'Authorization': `Bearer ${arkKey}`,
+                    'Content-Type': 'application/json',
+                },
+                timeout: 25000,
+            }
+        );
+
+        let visionJsonStr = visionResp.data?.choices?.[0]?.message?.content || '{}';
+        visionJsonStr = visionJsonStr.replace(/^```json\s*/i, '').replace(/\s*```$/, '').trim();
+        let mealFacts = {};
+        try { mealFacts = JSON.parse(visionJsonStr); } catch (e) { mealFacts = { raw: visionJsonStr }; }
+        _log('meal_vision_deconstructed', { dishName: mealFacts.dish_name });
+
+        // 步骤 2：DeepSeek V4 Flash 严密测算代谢与生成医嘱
+        const patientContext = meta.patientProfile || meta.memberName || '康复期患者';
+        const calcResp = await axios.post(
+            `${arkBase}/chat/completions`,
+            {
+                model: process.env.ARK_MODEL || 'deepseek-v4-flash-ga-260731',
+                messages: [
+                    {
+                        role: 'system',
+                        content: '你是一名资深临床营养与代谢专家。请依据《中国食物成分表》对输入的食材明细做严密换算，并结合患者情况输出医嘱。',
+                    },
+                    {
+                        role: 'user',
+                        content: `【食材实测事实】：\n${JSON.stringify(mealFacts, null, 2)}\n\n【患者档案画像】：\n${patientContext}\n\n请输出纯 JSON：\n{\n  "calories": 总热量kcal(整数),\n  "protein_g": 蛋白质g(保留1位小数),\n  "carbs_g": 碳水g(保留1位小数),\n  "fat_g": 脂肪g(保留1位小数),\n  "sodium_mg": 预估钠mg(整数),\n  "clinical_advice": "针对该患者处境的1句简短医嘱点睛",\n  "suggested_questions": ["针对这餐的追问1", "追问2"]\n}\n只输出纯 JSON。`,
+                    },
+                ],
+                temperature: 0.2,
+            },
+            {
+                headers: {
+                    'Authorization': `Bearer ${arkKey}`,
+                    'Content-Type': 'application/json',
+                },
+                timeout: 20000,
+            }
+        );
+
+        let calcJsonStr = calcResp.data?.choices?.[0]?.message?.content || '{}';
+        calcJsonStr = calcJsonStr.replace(/^```json\s*/i, '').replace(/\s*```$/, '').trim();
+        let calcData = {};
+        try { calcData = JSON.parse(calcJsonStr); } catch (e) { calcData = {}; }
+
+        // 若提供了 memberId，自动将打卡数据沉淀至 mini_health.records
+        if (meta.memberId) {
+            try {
+                const { saveRecord } = require('./supabase_store');
+                await saveRecord({
+                    memberId: meta.memberId,
+                    recordType: 'meal',
+                    metrics: {
+                        dish_name: mealFacts.dish_name || '餐食记录',
+                        ingredients: mealFacts.ingredients || [],
+                        ...calcData,
+                    },
+                    sourceMsgId: meta.sourceMsgId || null,
+                });
+                _log('meal_record_saved', { memberId: meta.memberId, calories: calcData.calories });
+            } catch (recErr) {
+                _log('meal_record_save_warn', { error: recErr.message });
+            }
+        }
+
+        const dishName = mealFacts.dish_name || '中餐记录';
+        const cal = calcData.calories ? `${calcData.calories} kcal` : '已估算';
+        const pro = calcData.protein_g ? `${calcData.protein_g}g` : '充沛';
+        const advice = calcData.clinical_advice || '膳食均衡，有助康复';
+
+        return `[餐食打卡: ${dishName} | 摄入热量: ${cal} | 优质蛋白: ${pro} | 营养点睛: ${advice}]`;
+
+    } catch (err) {
+        _log('meal_dual_engine_error', { error: err.message, reason: '双核识餐异常，降级至 Gemini 描述' });
+        const desc = await _describeImage(buffer, null);
+        return `[餐食图片: ${desc}]`;
+    }
+}
+
+/**
+ * 直接处理内存 Buffer 媒体（供 MiniHealth HTTP 网关调用）
+ */
+async function handleDirectMedia(params) {
+    const { buffer, msgtype, filename = '', msgid = Date.now().toString(), meta = {} } = params;
+    if (!buffer || buffer.length === 0) {
+        return { content: `[${msgtype}: 文件为空]`, mediaUrl: null };
+    }
+
+    let mediaUrl = null;
+    const extMap  = { image: 'jpg', voice: 'amr', video: 'mp4', meal: 'jpg', report: 'jpg' };
+    const ctMap   = { image: 'image/jpeg', voice: 'audio/amr', video: 'video/mp4', file: 'application/octet-stream', meal: 'image/jpeg', report: 'image/jpeg' };
+    const ext     = extMap[msgtype] || (filename.split('.').pop() || 'bin');
+    const ct      = ctMap[msgtype]  || 'application/octet-stream';
+    const dateStr = new Date().toISOString().slice(0, 10);
+    const gcsName = `${dateStr}/${msgid}.${ext}`;
+
+    try {
+        mediaUrl = await _uploadToGCS(buffer, gcsName, ct);
+        _log('direct_media_uploaded', { msgtype, sizeKB: Math.round(buffer.length / 1024), mediaUrl });
+    } catch (uploadErr) {
+        _log('direct_media_upload_warn', { error: uploadErr.message });
+    }
+
+    let content = '';
+
+    if (msgtype === 'voice') {
+        const transcript = await _transcribeAudio(buffer);
+        content = transcript
+            ? `[语音转文字]: ${transcript}`
+            : '[客户发来语音消息，请回复引导其用文字说明需求]';
+
+    } else if (msgtype === 'meal') {
+        content = await _analyzeMealWithDoubaoAndDeepseek(buffer, { ...meta, msgId: msgid });
+
+    } else if (msgtype === 'report' || msgtype === 'image') {
+        const desc = await _describeImage(buffer, mediaUrl);
+        content = desc.startsWith('[图片') ? desc : `[图片: ${desc}]`;
+
+    } else if (msgtype === 'file') {
+        const fileExt = (filename.split('.').pop() || '').toLowerCase();
+        if (fileExt === 'pdf') {
+            try {
+                let rawText = '';
+                if (pdfParse) {
+                    try {
+                        const pdfData = await pdfParse(buffer);
+                        rawText = (pdfData.text || '').trim();
+                    } catch (e) { /* ignore */ }
+                }
+                if (rawText) {
+                    const summary = await _summarizeDocument(rawText, filename);
+                    content = `[文件: ${filename} | AI摘要: ${summary}]`;
+                } else {
+                    const ocrSummary = await _ocrPdfWithGemini(buffer, mediaUrl, filename);
+                    content = ocrSummary
+                        ? `[文件: ${filename} | AI摘要: ${ocrSummary}]`
+                        : `[文件: ${filename}（扫描件，OCR 未能提取内容）]`;
+                }
+            } catch (e) {
+                content = `[文件: ${filename}（处理失败）]`;
+            }
+        } else {
+            content = `[客户发来文件：${filename}]`;
+        }
+    } else {
+        content = `[${msgtype}]`;
+    }
+
+    return { content, mediaUrl };
+}
+
+module.exports = {
+    handleMedia,
+    handleDirectMedia,
+    _transcribeAudio,
+    _describeImage,
+    _analyzeMealWithDoubaoAndDeepseek,
+};
+
