@@ -18,6 +18,21 @@ const { handleDirectMedia } = require('./media_handler');
 const { saveMessage, getRecentHistory } = require('./supabase_store');
 
 const SKILL_PLATFORM_URL = process.env.SKILL_PLATFORM_URL || 'https://skill-platform-yo5337ccva-de.a.run.app';
+const MINIHEALTH_API_TOKEN = process.env.MINIHEALTH_API_TOKEN || '';
+
+/**
+ * 验证 MiniHealth 前端请求的 Token
+ * Header: X-MiniHealth-Token: <token>
+ */
+function verifyMinihealthToken(req, res) {
+    if (!MINIHEALTH_API_TOKEN) return true; // 未配置 Token 时跳过验证（本地开发）
+    const incoming = req.headers['x-minihealth-token'] || '';
+    if (incoming !== MINIHEALTH_API_TOKEN) {
+        sendJson(res, 401, { error: 'Unauthorized', message: 'Invalid or missing X-MiniHealth-Token' });
+        return false;
+    }
+    return true;
+}
 
 function _log(type, extra = {}) {
     console.log(JSON.stringify({ severity: 'INFO', type, ...extra, ts: new Date().toISOString() }));
@@ -116,7 +131,7 @@ async function handleMiniHealthChat(req, res, body) {
                 _log('calling_skill_platform', { url: spUrl, memberId, historyLen: chatPayload.history.length });
 
                 const spResp = await axios.post(spUrl, chatPayload, {
-                    timeout: 35000,
+                    timeout: 60000,
                     headers: { 'Content-Type': 'application/json' },
                 });
 
@@ -257,6 +272,7 @@ function createHttpServer(port = 8080) {
 
         // 2. MiniHealth 历史记录拉取
         if (req.method === 'GET' && pathname.startsWith('/api/minihealth/history/')) {
+            if (!verifyMinihealthToken(req, res)) return;
             const memberId = pathname.replace('/api/minihealth/history/', '');
             await handleMiniHealthHistory(req, res, decodeURIComponent(memberId));
             return;
@@ -264,6 +280,7 @@ function createHttpServer(port = 8080) {
 
         // 3. MiniHealth 问答会话
         if (req.method === 'POST' && pathname === '/api/minihealth/chat') {
+            if (!verifyMinihealthToken(req, res)) return;
             let bodyStr = '';
             req.on('data', chunk => {
                 bodyStr += chunk;
