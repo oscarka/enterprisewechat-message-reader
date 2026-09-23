@@ -11,6 +11,7 @@ RUN npm install
 
 # 拷贝源代码（不包括 .env，env 由 Cloud Run 注入）
 COPY archiver.js .
+COPY http_gateway.js .
 COPY name_resolver.js .
 COPY seq_store.js .
 COPY supabase_store.js .
