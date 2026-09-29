@@ -12,9 +12,9 @@ const POOLER_URL = process.env.SUPABASE_POOLER_URL
 const pool = new Pool({
     connectionString: POOLER_URL,
     ssl: { rejectUnauthorized: false, checkServerIdentity: () => undefined },
-    max: 3,
+    max: 10,
     idleTimeoutMillis: 30000,
-    connectionTimeoutMillis: 10000,
+    connectionTimeoutMillis: 30000,
 });
 
 pool.on('error', (err) => {

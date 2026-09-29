@@ -64,74 +64,129 @@ async function _uploadToGCS(buffer, filename, contentType) {
     return `https://storage.googleapis.com/${MEDIA_BUCKET}/${filename}`;
 }
 
-async function _describeImage(buffer, gcsUrl) {
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) return '[图片]';
-
+async function _describeWithDoubao(buffer, isTextHeavy = false) {
+    const arkKey = process.env.DOUBAO_API_KEY || process.env.ARK_API_KEY;
+    const arkModel = process.env.ARK_VISION_MODEL || process.env.DOUBAO_VISION_MODEL || 'doubao-seed-2-0-mini-260428';
+    if (!arkKey) return null;
+    const axios = require('axios');
+    const prompt = isTextHeavy
+        ? `请对这张图片做完整的文字识别（OCR），提取所有可见的文字内容、数字、化验指标名称、参考范围与单位，逐行输出，保留表格结构，原样输出所有文字。`
+        : `请用1-3句话描述这张图片的主要内容。`;
     try {
-        const ai = new GoogleGenAI({ apiKey });
-
-        let part;
-        if (buffer.length <= INLINE_MAX_BYTES) {
-            part = { inlineData: { mimeType: 'image/jpeg', data: buffer.toString('base64') } };
-        } else {
-            _log('image_use_url', { sizeKB: Math.round(buffer.length / 1024), gcsUrl });
-            part = { fileData: { mimeType: 'image/jpeg', fileUri: gcsUrl } };
-        }
-
-        // ── 第一步：判断图片类型 ──────────────────────────────────────────────
-        const classifyResp = await ai.models.generateContent({
-            model: 'gemini-2.5-flash-lite',
-            contents: [{
-                parts: [
-                    { text: '这张图片属于哪种类型？只回答一个词：文档、报告、截图、照片。（文档=合同/证件/表格，报告=检验/化验/检查报告，截图=手机/电脑截图含文字，照片=人物/风景/产品等）' },
-                    part,
-                ],
-            }],
+        const res = await axios.post('https://ark.cn-beijing.volces.com/api/v3/responses', {
+            model: arkModel,
+            input: [
+                {
+                    role: 'user',
+                    content: [
+                        {
+                            type: 'input_image',
+                            image_url: `data:image/jpeg;base64,${buffer.toString('base64')}`
+                        },
+                        {
+                            type: 'input_text',
+                            text: prompt
+                        }
+                    ]
+                }
+            ]
+        }, {
+            headers: {
+                'Authorization': `Bearer ${arkKey}`,
+                'Content-Type': 'application/json'
+            },
+            timeout: 25000
         });
-        const imgType = (classifyResp.text || '').trim();
-        _log('image_classify', { type: imgType, sizeKB: Math.round(buffer.length / 1024) });
+        const msgItem = res.data?.output?.find(item => item.type === 'message' && item.role === 'assistant');
+        const text = msgItem?.content?.find(c => c.type === 'output_text')?.text || '';
+        return text.trim() || null;
+    } catch (err) {
+        _log('doubao_vision_fallback_err', { message: err.message });
+        return null;
+    }
+}
 
-        // ── 第二步：根据类型选择不同处理策略 ────────────────────────────────
-        const isTextHeavy = /文档|报告|截图/.test(imgType);
+async function _describeImage(buffer, gcsUrl, isExplicitReport = false) {
+    const apiKey = process.env.GEMINI_API_KEY;
+    let isTextHeavy = isExplicitReport;
 
-        let prompt;
-        if (isTextHeavy) {
-            // 文字密集型：全量 OCR，保留所有数值和结构
-            prompt = `请对这张图片做完整的文字识别（OCR），提取所有可见的文字内容。
+    if (apiKey) {
+        try {
+            const ai = new GoogleGenAI({ apiKey });
+
+            let part;
+            if (buffer.length <= INLINE_MAX_BYTES) {
+                part = { inlineData: { mimeType: 'image/jpeg', data: buffer.toString('base64') } };
+            } else {
+                _log('image_use_url', { sizeKB: Math.round(buffer.length / 1024), gcsUrl });
+                part = { fileData: { mimeType: 'image/jpeg', fileUri: gcsUrl } };
+            }
+
+            if (!isExplicitReport) {
+                try {
+                    const classifyResp = await ai.models.generateContent({
+                        model: 'gemini-2.5-flash',
+                        contents: [{
+                            parts: [
+                                { text: '这张图片属于哪种类型？只回答一个词：文档、报告、截图、照片。（文档=合同/证件/表格，报告=检验/化验/检查报告，截图=手机/电脑截图含文字，照片=人物/风景/产品等）' },
+                                part,
+                            ],
+                        }],
+                    });
+                    const imgType = (classifyResp.text || '').trim();
+                    _log('image_classify', { type: imgType, sizeKB: Math.round(buffer.length / 1024) });
+                    isTextHeavy = /文档|报告|截图/.test(imgType);
+                } catch (ce) {
+                    _log('image_classify_warn', { message: ce.message });
+                }
+            }
+
+            let prompt;
+            if (isTextHeavy) {
+                prompt = `请对这张图片做完整的文字识别（OCR），提取所有可见的文字内容。
 要求：
 1. 逐行保留所有数字、指标名称、参考范围、单位
 2. 保留表格结构（用竖线分隔列）
 3. 保留所有标注（如箭头↑↓、H/L标记）
 4. 不要总结，不要省略，原样输出所有文字
 格式：[图片内容:\n（完整OCR文字）]`;
-        } else {
-            // 普通图片：简洁描述
-            prompt = '请用1-3句话描述这张图片的主要内容（直接描述，不要解释）：';
+            } else {
+                prompt = '请用1-3句话描述这张图片的主要内容（直接描述，不要解释）：';
+            }
+
+            const resp = await ai.models.generateContent({
+                model: 'gemini-2.5-flash',
+                contents: [{
+                    parts: [
+                        { text: prompt },
+                        part,
+                    ],
+                }],
+                config: isTextHeavy ? { thinkingConfig: { thinkingBudget: 0 } } : undefined,
+            });
+
+            const text = (resp.text || '').trim();
+            if (text) {
+                if (isTextHeavy) {
+                    return text.startsWith('[图片') ? text : `[图片内容:\n${text}]`;
+                }
+                return `[图片: ${text}]`;
+            }
+        } catch (e) {
+            _log('gemini_vision_error', { message: e.message });
         }
-
-        const resp = await ai.models.generateContent({
-            model: 'gemini-2.5-flash',   // 文字类用更强的模型
-            contents: [{
-                parts: [
-                    { text: prompt },
-                    part,
-                ],
-            }],
-            config: isTextHeavy ? { thinkingConfig: { thinkingBudget: 0 } } : undefined,
-        });
-
-        const text = (resp.text || '').trim() || '[图片]';
-        if (isTextHeavy) {
-            // 包装成统一格式
-            return text.startsWith('[图片') ? text : `[图片内容:\n${text}]`;
-        }
-        return `[图片: ${text}]`;
-
-    } catch (e) {
-        _log('vision_error', { message: e.message });
-        return '[图片]';
     }
+
+    // 备用降级方案：火山 Ark 豆包视觉模型 (doubao-seed-2-0-mini-260428)
+    const doubaoText = await _describeWithDoubao(buffer, isTextHeavy);
+    if (doubaoText) {
+        if (isTextHeavy) {
+            return doubaoText.startsWith('[图片') ? doubaoText : `[图片内容:\n${doubaoText}]`;
+        }
+        return `[图片: ${doubaoText}]`;
+    }
+
+    return '[图片: 无法解析图像内容]';
 }
 
 // ─── Gemini 文档摘要 ─────────────────────────────────────────────────────────
@@ -364,7 +419,7 @@ async function handleMedia(sdk, msg) {
 
         if (msg.msgtype === 'image') {
             const desc = await _describeImage(buffer, mediaUrl);
-            content = `[图片: ${desc}]`;
+            content = desc.startsWith('[图片') ? desc : `[图片: ${desc}]`;
 
         } else if (msg.msgtype === 'voice') {
             // STT 转写（云端 STT 路径）
@@ -446,92 +501,134 @@ async function _analyzeMealWithDoubaoAndDeepseek(buffer, meta = {}) {
     const arkBase = process.env.DOUBAO_BASE_URL || 'https://ark.cn-beijing.volces.com/api/v3';
     const axios = require('axios');
 
-    if (!arkKey) {
-        _log('meal_analyze_no_key', { reason: '未配置 ARK_API_KEY/DOUBAO_API_KEY，降级至 Gemini 描述' });
-        const desc = await _describeImage(buffer, null);
-        return `[餐食: ${desc}]`;
-    }
-
     try {
         const base64Img = buffer.toString('base64');
+        let mealFacts = {};
+        let visionJsonStr = '';
 
-        // 步骤 1：调用多模态模型解构食材
-        const visionModel = process.env.DOUBAO_VISION_MODEL || process.env.ARK_MODEL || 'deepseek-v4-flash-ga-260731';
-        const visionResp = await axios.post(
-            `${arkBase}/chat/completions`,
-            {
-                model: visionModel,
-                messages: [
+        const patientContext = meta.patientProfile || meta.memberName || '康复期患者';
+
+        // 步骤 1：优先调用多模态模型 doubao-seed-2-0-mini-260428 解构食材与营养
+        if (arkKey) {
+            try {
+                const visionModel = process.env.DOUBAO_VISION_MODEL || process.env.ARK_VISION_MODEL || 'doubao-seed-2-0-mini-260428';
+                const visionPrompt = `你是资深中式食材解构与临床营养专家。患者处境画像：${patientContext}。请用中文识别图片中的全部菜品与主食，预估熟重并依据《中国食物成分表》测算宏量营养素与热量，以纯 JSON 格式输出：\n{\n  "dish_name": "主要菜品中文名称",\n  "cooking_method": "烹饪方式(如清蒸/少油炒/红烧/油炸)",\n  "ingredients": [\n    { "name": "食材中文名称", "weight_g": 预估熟重克数 }\n  ],\n  "calories": 总热量kcal(整数，依据食材及重量真实测算),\n  "protein_g": 蛋白质g(保留1位小数),\n  "carbs_g": 碳水g(保留1位小数),\n  "fat_g": 脂肪g(保留1位小数),\n  "sodium_mg": 预估钠mg(整数),\n  "clinical_advice": "针对该患者康复处境的1句中文临床点睛建议"\n}\n请始终全部使用中文，只输出纯 JSON，严禁任何额外文本或 Markdown 标记。`;
+
+                const visionResp = await axios.post(
+                    `${arkBase}/responses`,
                     {
-                        role: 'user',
-                        content: [
+                        model: visionModel,
+                        input: [
                             {
-                                type: 'text',
-                                text: '你是资深中式食材解构师。请识别图片中的全部菜品与主食，只输出观察事实，以纯 JSON 格式输出：\n{\n  "dish_name": "主要菜品名称",\n  "cooking_method": "烹饪方式(如清蒸/少油炒/红烧/油炸)",\n  "ingredients": [\n    { "name": "食材名称", "weight_g": 预估熟重克数 }\n  ],\n  "notes": "口味特征(如清淡/多油/高钠/加糖)"\n}\n只输出纯 JSON，严禁任何额外文本或 Markdown 标记。',
-                            },
-                            {
-                                type: 'image_url',
-                                image_url: { url: `data:image/jpeg;base64,${base64Img}` },
+                                role: 'user',
+                                content: [
+                                    {
+                                        type: 'input_image',
+                                        image_url: `data:image/jpeg;base64,${base64Img}`,
+                                    },
+                                    {
+                                        type: 'input_text',
+                                        text: visionPrompt,
+                                    },
+                                ],
                             },
                         ],
                     },
-                ],
-                temperature: 0.1,
-            },
-            {
-                headers: {
-                    'Authorization': `Bearer ${arkKey}`,
-                    'Content-Type': 'application/json',
-                },
-                timeout: 25000,
-            }
-        );
+                    {
+                        headers: {
+                            'Authorization': `Bearer ${arkKey}`,
+                            'Content-Type': 'application/json',
+                        },
+                        timeout: 25000,
+                    }
+                );
 
-        let visionJsonStr = visionResp.data?.choices?.[0]?.message?.content || '{}';
-        visionJsonStr = visionJsonStr.replace(/^```json\s*/i, '').replace(/\s*```$/, '').trim();
-        let mealFacts = {};
+                const msgItem = visionResp.data?.output?.find(item => item.type === 'message' && item.role === 'assistant');
+                visionJsonStr = msgItem?.content?.find(c => c.type === 'output_text')?.text || '';
+            } catch (err) {
+                _log('doubao_meal_vision_error', { error: err.message });
+            }
+        }
+
+        // 若 Doubao Vision 未解析出有效结果，尝试用 Gemini 2.5 Flash 解构食材与营养
+        if (!visionJsonStr && process.env.GEMINI_API_KEY) {
+            try {
+                const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+                const gResp = await ai.models.generateContent({
+                    model: 'gemini-2.5-flash',
+                    contents: [{
+                        parts: [
+                            { text: `你是资深中式食材解构与临床营养专家。患者处境：${patientContext}。请识别图片中的全部菜品与主食，预估熟重并依据《中国食物成分表》测算营养素与热量，以纯 JSON 格式输出：\n{\n  "dish_name": "主要菜品名称",\n  "cooking_method": "烹饪方式",\n  "ingredients": [\n    { "name": "食材名称", "weight_g": 预估熟重克数 }\n  ],\n  "calories": 总热量kcal(整数),\n  "protein_g": 蛋白质g(保留1位小数),\n  "carbs_g": 碳水g(保留1位小数),\n  "fat_g": 脂肪g(保留1位小数),\n  "sodium_mg": 预估钠mg(整数),\n  "clinical_advice": "针对该患者康复处境的1句临床点睛建议"\n}\n只输出纯 JSON，严禁任何额外文本。` },
+                            { inlineData: { mimeType: 'image/jpeg', data: base64Img } }
+                        ]
+                    }]
+                });
+                visionJsonStr = gResp.text || '';
+            } catch (gErr) {
+                _log('gemini_meal_vision_error', { error: gErr.message });
+            }
+        }
+
+        visionJsonStr = (visionJsonStr || '').replace(/^```json\s*/i, '').replace(/\s*```$/, '').trim();
         try { mealFacts = JSON.parse(visionJsonStr); } catch (e) { mealFacts = { raw: visionJsonStr }; }
-        _log('meal_vision_deconstructed', { dishName: mealFacts.dish_name });
+        _log('meal_vision_deconstructed', { dishName: mealFacts.dish_name, cal: mealFacts.calories });
 
-        // 步骤 2：DeepSeek V4 Flash 严密测算代谢与生成医嘱
-        const patientContext = meta.patientProfile || meta.memberName || '康复期患者';
-        const calcResp = await axios.post(
-            `${arkBase}/chat/completions`,
-            {
-                model: process.env.ARK_MODEL || 'deepseek-v4-flash-ga-260731',
-                messages: [
-                    {
-                        role: 'system',
-                        content: '你是一名资深临床营养与代谢专家。请依据《中国食物成分表》对输入的食材明细做严密换算，并结合患者情况输出医嘱。',
-                    },
-                    {
-                        role: 'user',
-                        content: `【食材实测事实】：\n${JSON.stringify(mealFacts, null, 2)}\n\n【患者档案画像】：\n${patientContext}\n\n请输出纯 JSON：\n{\n  "calories": 总热量kcal(整数),\n  "protein_g": 蛋白质g(保留1位小数),\n  "carbs_g": 碳水g(保留1位小数),\n  "fat_g": 脂肪g(保留1位小数),\n  "sodium_mg": 预估钠mg(整数),\n  "clinical_advice": "针对该患者处境的1句简短医嘱点睛",\n  "suggested_questions": ["针对这餐的追问1", "追问2"]\n}\n只输出纯 JSON。`,
-                    },
-                ],
-                temperature: 0.2,
-            },
-            {
-                headers: {
-                    'Authorization': `Bearer ${arkKey}`,
-                    'Content-Type': 'application/json',
-                },
-                timeout: 20000,
+        // 步骤 2：提取或计算代谢与生成医嘱
+        let calcData = {
+            calories: typeof mealFacts.calories === 'number' ? mealFacts.calories : (parseInt(mealFacts.calories, 10) || 0),
+            protein_g: typeof mealFacts.protein_g === 'number' ? mealFacts.protein_g : (parseFloat(mealFacts.protein_g) || 0),
+            carbs_g: typeof mealFacts.carbs_g === 'number' ? mealFacts.carbs_g : (parseFloat(mealFacts.carbs_g) || 0),
+            fat_g: typeof mealFacts.fat_g === 'number' ? mealFacts.fat_g : (parseFloat(mealFacts.fat_g) || 0),
+            sodium_mg: typeof mealFacts.sodium_mg === 'number' ? mealFacts.sodium_mg : (parseInt(mealFacts.sodium_mg, 10) || 0),
+            clinical_advice: mealFacts.clinical_advice || '',
+        };
+
+        // 如果视觉阶段未能算出热量数值，则调用 DeepSeek 测算补充
+        if (!calcData.calories || calcData.calories <= 0) {
+            if (arkKey) {
+                try {
+                    const calcResp = await axios.post(
+                        `${arkBase}/chat/completions`,
+                        {
+                            model: process.env.ARK_MODEL || 'deepseek-v4-flash-ga-260731',
+                            messages: [
+                                {
+                                    role: 'system',
+                                    content: '你是一名资深临床营养与代谢专家。请依据《中国食物成分表》对输入的食材明细做严密换算，并结合患者情况输出医嘱。',
+                                },
+                                {
+                                    role: 'user',
+                                    content: `【食材实测事实】：\n${JSON.stringify(mealFacts, null, 2)}\n\n【患者档案画像】：\n${patientContext}\n\n请输出纯 JSON：\n{\n  "calories": 总热量kcal(整数),\n  "protein_g": 蛋白质g(保留1位小数),\n  "carbs_g": 碳水g(保留1位小数),\n  "fat_g": 脂肪g(保留1位小数),\n  "sodium_mg": 预估钠mg(整数),\n  "clinical_advice": "针对该患者处境的1句简短医嘱点睛"\n}\n只输出纯 JSON。`,
+                                },
+                            ],
+                            temperature: 0.2,
+                        },
+                        {
+                            headers: {
+                                'Authorization': `Bearer ${arkKey}`,
+                                'Content-Type': 'application/json',
+                            },
+                            timeout: 15000,
+                        }
+                    );
+
+                    let calcJsonStr = calcResp.data?.choices?.[0]?.message?.content || '{}';
+                    calcJsonStr = calcJsonStr.replace(/^```json\s*/i, '').replace(/\s*```$/, '').trim();
+                    const deepseekData = JSON.parse(calcJsonStr);
+                    calcData = { ...calcData, ...deepseekData };
+                } catch (cErr) {
+                    _log('meal_calc_error', { error: cErr.message });
+                }
             }
-        );
+        }
 
-        let calcJsonStr = calcResp.data?.choices?.[0]?.message?.content || '{}';
-        calcJsonStr = calcJsonStr.replace(/^```json\s*/i, '').replace(/\s*```$/, '').trim();
-        let calcData = {};
-        try { calcData = JSON.parse(calcJsonStr); } catch (e) { calcData = {}; }
-
-        // 若提供了 memberId，自动将打卡数据沉淀至 mini_health.records
+        // 若提供了 memberId，自动将打卡数据沉淀至 mini_health.records (统一为 'diet')
         if (meta.memberId) {
             try {
                 const { saveRecord } = require('./supabase_store');
                 await saveRecord({
                     memberId: meta.memberId,
-                    recordType: 'meal',
+                    recordType: 'diet',
                     metrics: {
                         dish_name: mealFacts.dish_name || '餐食记录',
                         ingredients: mealFacts.ingredients || [],
@@ -545,15 +642,18 @@ async function _analyzeMealWithDoubaoAndDeepseek(buffer, meta = {}) {
             }
         }
 
-        const dishName = mealFacts.dish_name || '中餐记录';
+        const dishName = mealFacts.dish_name || '餐食记录';
+        const ingList = (mealFacts.ingredients || []).map(i => `${i.name || ''}(${i.weight_g || 0}g)`).join('、');
         const cal = calcData.calories ? `${calcData.calories} kcal` : '已估算';
         const pro = calcData.protein_g ? `${calcData.protein_g}g` : '充沛';
+        const fat = calcData.fat_g ? `${calcData.fat_g}g` : '适中';
+        const carbs = calcData.carbs_g ? `${calcData.carbs_g}g` : '适量';
         const advice = calcData.clinical_advice || '膳食均衡，有助康复';
 
-        return `[餐食打卡: ${dishName} | 摄入热量: ${cal} | 优质蛋白: ${pro} | 营养点睛: ${advice}]`;
+        return `[餐食打卡: ${dishName} | 食材: ${ingList || '均衡搭配'} | 摄入热量: ${cal} | 优质蛋白: ${pro} | 脂肪: ${fat} | 碳水: ${carbs} | 营养点睛: ${advice}]`;
 
     } catch (err) {
-        _log('meal_dual_engine_error', { error: err.message, reason: '双核识餐异常，降级至 Gemini 描述' });
+        _log('meal_dual_engine_error', { error: err.message, reason: '双核识餐异常，降级至描述' });
         const desc = await _describeImage(buffer, null);
         return `[餐食图片: ${desc}]`;
     }
@@ -595,7 +695,7 @@ async function handleDirectMedia(params) {
         content = await _analyzeMealWithDoubaoAndDeepseek(buffer, { ...meta, msgId: msgid });
 
     } else if (msgtype === 'report' || msgtype === 'image') {
-        const desc = await _describeImage(buffer, mediaUrl);
+        const desc = await _describeImage(buffer, mediaUrl, msgtype === 'report');
         content = desc.startsWith('[图片') ? desc : `[图片: ${desc}]`;
 
     } else if (msgtype === 'file') {
