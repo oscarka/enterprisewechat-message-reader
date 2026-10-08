@@ -8,6 +8,9 @@ SERVICE_NAME="wechat-archiver"
 REGION="us-west1"
 IMAGE="gcr.io/$PROJECT_ID/$SERVICE_NAME"
 BUCKET="wechat-archiver-state"
+# MiniHealth 专用模式（默认开启）：只运行 MiniHealth 网关，不拉取企微会话存档、不挂固定出口 IP。
+# 需要同时恢复企微存档时：MINIHEALTH_ONLY=0 ./deploy.sh
+MINIHEALTH_ONLY="${MINIHEALTH_ONLY:-1}"
 
 echo "======================================"
 echo "  wechat-archiver 部署脚本"
@@ -21,7 +24,7 @@ gsutil mb -p $PROJECT_ID -l $REGION "gs://$BUCKET" 2>/dev/null \
   || echo "ℹ️  桶已存在，跳过"
 
 # 把当前进度文件上传到 GCS（仅首次：GCS 上不存在时才上传，避免覆盖已有进度）
-if [ -f "data/archiving_seq.json" ]; then
+if [ "$MINIHEALTH_ONLY" != "1" ] && [ -f "data/archiving_seq.json" ]; then
   if gsutil -q stat "gs://$BUCKET/archiver_seq.json" 2>/dev/null; then
     echo "ℹ️  GCS 上已有 seq 文件，跳过上传（保留已有进度，防止历史消息重播）"
   else
@@ -48,7 +51,13 @@ if [ ! -f ".env" ]; then
 fi
 
 ENV_VARS=$(grep -v '^#' .env | grep -v '^[[:space:]]*$' | tr '\n' ',' | sed 's/,$//')
-ENV_VARS="${ENV_VARS},STATE_BUCKET=${BUCKET}"
+ENV_VARS="${ENV_VARS},STATE_BUCKET=${BUCKET},MINIHEALTH_ONLY=${MINIHEALTH_ONLY}"
+
+# 企微存档需要固定出口 IP（企微白名单）；MiniHealth 专用模式不需要
+VPC_FLAGS=""
+if [ "$MINIHEALTH_ONLY" != "1" ]; then
+  VPC_FLAGS="--vpc-connector wechat-connector --vpc-egress all-traffic"
+fi
 
 # 4. 部署到 Cloud Run
 echo ""
@@ -64,8 +73,7 @@ gcloud run deploy "$SERVICE_NAME" \
   --memory 512Mi \
   --cpu 1 \
   --no-cpu-throttling \
-  --vpc-connector wechat-connector \
-  --vpc-egress all-traffic \
+  $VPC_FLAGS \
   --set-env-vars "$ENV_VARS"
 
 echo ""

@@ -21,7 +21,8 @@ require('dotenv').config();
 const http        = require('http');
 const fs          = require('fs');
 const path        = require('path');
-const { WeWorkChat } = require('wework-chat-node');
+// MiniHealth 专用模式下不需要企微原生 SDK（避免本地/镜像缺少 native addon 时整体崩溃）
+const { WeWorkChat } = process.env.MINIHEALTH_ONLY === '1' ? {} : require('wework-chat-node');
 
 const NameResolver  = require('./name_resolver');
 const SeqStore      = require('./seq_store');
@@ -177,7 +178,19 @@ async function processMessage(msg, nameResolver) {
 
 // ─── 主轮询循环 ───────────────────────────────────────────────
 async function main() {
+    // MiniHealth 专用模式（MINIHEALTH_ONLY=1）：HTTP 网关已在模块加载时启动，
+    // 这里只初始化存储表，跳过企微会话存档拉取（无需企微密钥/私钥，也不会转发企微消息）
+    if (process.env.MINIHEALTH_ONLY === '1') {
+        log('INFO', 'startup', { message: 'MINIHEALTH_ONLY=1：仅运行 MiniHealth 网关，跳过企微会话存档拉取' });
+        try {
+            await initSchema();
+        } catch (e) {
+            log('WARNING', 'supabase_init_failed', { message: e.message });
+        }
+        return;
+    }
     // 1. 检查私钥
+
     if (!fs.existsSync(PRIVATE_KEY_PATH)) {
         log('CRITICAL', 'startup', { message: `私钥不存在: ${PRIVATE_KEY_PATH}` });
         process.exit(1);
