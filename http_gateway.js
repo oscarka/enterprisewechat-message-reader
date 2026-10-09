@@ -14,7 +14,7 @@ const http = require('http');
 const axios = require('axios');
 const { createAndRunMediaTask } = require('./media_task_manager');
 const { enqueueText, touchMediaQueue, tryFlush } = require('./inbound_queue');
-const { handleDirectMedia } = require('./media_handler');
+const { handleDirectMedia, extractReportText } = require('./media_handler');
 const { saveMessage, getRecentHistory } = require('./supabase_store');
 
 const SKILL_PLATFORM_URL = process.env.SKILL_PLATFORM_URL || 'https://skill-platform-yo5337ccva-de.a.run.app';
@@ -41,7 +41,7 @@ function _log(type, extra = {}) {
 function setCorsHeaders(res) {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, X-MiniHealth-Token');
 }
 
 function sendJson(res, statusCode, data) {
@@ -301,6 +301,30 @@ function createHttpServer(port = 8080) {
                     await handleMiniHealthChat(req, res, body);
                 } catch (err) {
                     sendJson(res, 400, { error: 'Invalid JSON payload' });
+                }
+            });
+            return;
+        }
+
+        // 4. MiniHealth 建档报告识别（只识别文字，不聊天、不入库）
+        if (req.method === 'POST' && pathname === '/api/minihealth/extract-report') {
+            if (!verifyMinihealthToken(req, res)) return;
+            let bodyStr = '';
+            req.on('data', chunk => {
+                bodyStr += chunk;
+                if (bodyStr.length > 30 * 1024 * 1024) req.destroy();
+            });
+            req.on('end', async () => {
+                try {
+                    const body = JSON.parse(bodyStr || '{}');
+                    if (!body.media) return sendJson(res, 400, { error: 'media is required' });
+                    const buffer = Buffer.from(String(body.media).replace(/^data:[^;]+;base64,/, ''), 'base64');
+                    const r = await extractReportText({ buffer, filename: body.fileName || 'report', mimeType: body.mimeType || '' });
+                    _log('minihealth_extract_report', { kind: r.kind, len: r.text.length });
+                    sendJson(res, 200, { success: true, text: r.text, kind: r.kind });
+                } catch (err) {
+                    _log('minihealth_extract_report_error', { error: err.message });
+                    sendJson(res, 422, { success: false, error: err.message });
                 }
             });
             return;

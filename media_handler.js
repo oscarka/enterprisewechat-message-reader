@@ -767,9 +767,41 @@ async function handleDirectMedia(params) {
     return { content, mediaUrl };
 }
 
+// ─── MiniHealth 建档：只做报告识别（不聊天、不入库），返回完整文字 ───────────────
+// PDF → Gemini 完整提取（多人分段 + 人数标记）；图片 → 视觉 OCR（Gemini，失败转豆包）
+async function extractReportText({ buffer, filename = 'report', mimeType = '' }) {
+    if (!buffer || buffer.length === 0) throw new Error('文件为空');
+    const lower = (filename || '').toLowerCase();
+    const isPdf = /pdf/.test(mimeType) || lower.endsWith('.pdf');
+    const isImage = /^image\//.test(mimeType) || /\.(jpe?g|png|webp|heic|bmp)$/.test(lower);
+    if (!isPdf && !isImage) throw new Error('暂只支持 PDF 或图片格式的报告');
+
+    let url = null;
+    if (buffer.length > INLINE_MAX_BYTES) {
+        try {
+            url = await _uploadToGCS(buffer, `onboarding/${Date.now()}_${Math.random().toString(36).slice(2, 6)}.${isPdf ? 'pdf' : 'jpg'}`, isPdf ? 'application/pdf' : 'image/jpeg');
+        } catch (e) { _log('onboarding_upload_warn', { error: e.message }); }
+    }
+
+    if (isPdf) {
+        let rawText = '';
+        if (pdfParse) {
+            try { rawText = ((await pdfParse(buffer)).text || '').trim(); } catch (e) { /* ignore */ }
+        }
+        const full = await _extractPdfFully(buffer, url, filename, rawText);
+        if (full) return { text: full, kind: 'pdf' };
+        if (rawText) return { text: rawText.slice(0, 8000), kind: 'pdf_text' };
+        throw new Error('PDF 内容无法识别（可能是加密或损坏的文件）');
+    }
+    const desc = await _describeImage(buffer, url, true);
+    if (!desc || /无法解析图像内容/.test(desc)) throw new Error('图片内容无法识别，请换一张更清晰的照片');
+    return { text: desc, kind: 'image' };
+}
+
 module.exports = {
     handleMedia,
     handleDirectMedia,
+    extractReportText,
     _transcribeAudio,
     _describeImage,
     _analyzeMealWithDoubaoAndDeepseek,
