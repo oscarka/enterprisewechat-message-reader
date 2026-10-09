@@ -62,6 +62,9 @@ async function handleMiniHealthChat(req, res, body) {
         mediaType = 'text', // 'text' | 'voice' | 'image' | 'meal' | 'report' | 'file'
         fileName = '',
         patientProfile = '',
+        // 前端构造的账本上下文（account_id / member_id / family_members），原样透传给平台，
+        // 否则经网关的消息拿不到 add_record / switch_member 等 AI 代劳工具
+        minihealth = null,
     } = body;
 
     if (!memberId) {
@@ -120,6 +123,7 @@ async function handleMiniHealthChat(req, res, body) {
                     context: {
                         available_apps: ['MiniHealth'],
                         current_recipient: cleanName,
+                        ...(minihealth && typeof minihealth === 'object' ? { minihealth } : {}),
                     },
                     history: history.slice(0, -1).map(h => ({ // 排除刚插入的本条，防止 prompt 里的当前问题与历史末尾重复
                         role: h.role,
@@ -138,8 +142,9 @@ async function handleMiniHealthChat(req, res, body) {
                 const data = spResp.data || {};
                 let reply = (data.reply || '').trim();
                 let suggestions = Array.isArray(data.suggestions) ? data.suggestions : [];
-                const careServiceCard = data.careServiceCard || null;
-                const requestId = data.requestId || `req_${Date.now()}`;
+                // 平台返回下划线字段（request_id / care_service_card），同时兼容旧的驼峰写法
+                const careServiceCard = data.care_service_card || data.careServiceCard || null;
+                const requestId = data.request_id || data.requestId || `req_${Date.now()}`;
 
                 // 若正文中包含 [推荐追问] 或 [追问建议]，做剥离保证卡片气泡纯净
                 const match = reply.match(/\[(?:推荐追问|追问建议|快捷追问)\][：:]\s*(.+)$/m);
