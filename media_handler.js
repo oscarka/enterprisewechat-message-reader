@@ -246,6 +246,39 @@ async function _ocrPdfWithGemini(buffer, gcsUrl, filename) {
     }
 }
 
+// ─── PDF 完整提取（MiniHealth 网关用）：不做摘要，保留人名/药名/剂量/化验数值 ───────
+// 多人文件按人分段，并在开头标注人数，由上层 AI 先向用户确认归属
+async function _extractPdfFully(buffer, gcsUrl, filename, rawText = '') {
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) return null;
+    try {
+        const ai = new GoogleGenAI({ apiKey });
+        let pdfPart;
+        if (buffer.length <= INLINE_MAX_BYTES) {
+            pdfPart = { inlineData: { mimeType: 'application/pdf', data: buffer.toString('base64') } };
+        } else {
+            pdfPart = { fileData: { mimeType: 'application/pdf', fileUri: gcsUrl } };
+        }
+        const prompt = `请完整提取这份PDF（文件名：${filename}）里的全部健康相关信息，不要做摘要，不要省略。要求：
+1. 先判断文件里涉及几位人员（姓名/性别/年龄）。如果多于1人，第一行输出：⚠️ 本文件包含N位人员：姓名A、姓名B；每个人单独分段，不要把不同人的数据混在一起。不要推测任何人与上传者的关系。
+2. 药物：逐条保留药名、规格、剂量、频次、疗程/用法。
+3. 化验/检查：逐项保留指标名称、数值、单位、参考范围、↑↓/异常标记；表格用竖线分隔列。
+4. 同时保留：检查日期、医院/科室、诊断、医嘱、注意事项。
+5. 只输出提取内容，不要解释。`;
+        const resp = await ai.models.generateContent({
+            model: 'gemini-2.5-flash',
+            contents: [{ parts: [{ text: prompt }, pdfPart] }],
+            config: { thinkingConfig: { thinkingBudget: 0 } },
+        });
+        const text = (resp.text || '').trim();
+        _log('pdf_full_extract', { filename, len: text.length, preview: text.slice(0, 80) });
+        return text || null;
+    } catch (e) {
+        _log('pdf_full_extract_error', { message: e.message, filename });
+        return null;
+    }
+}
+
 // ─── 火山引擎大模型 ASR（首选，速度快准确率高）──────────────────────────────
 
 async function _transcribeWithVolcano(buffer) {
@@ -709,9 +742,12 @@ async function handleDirectMedia(params) {
                         rawText = (pdfData.text || '').trim();
                     } catch (e) { /* ignore */ }
                 }
-                if (rawText) {
-                    const summary = await _summarizeDocument(rawText, filename);
-                    content = `[文件: ${filename} | AI摘要: ${summary}]`;
+                // 完整提取（含多人分段、药名剂量、化验数值）；失败时退回原文文本，再不行才用摘要
+                const full = await _extractPdfFully(buffer, mediaUrl, filename, rawText);
+                if (full) {
+                    content = `[文件: ${filename} | 文件内容:\n${full}\n]`;
+                } else if (rawText) {
+                    content = `[文件: ${filename} | 文件内容(原文截取):\n${rawText.slice(0, 6000)}\n]`;
                 } else {
                     const ocrSummary = await _ocrPdfWithGemini(buffer, mediaUrl, filename);
                     content = ocrSummary

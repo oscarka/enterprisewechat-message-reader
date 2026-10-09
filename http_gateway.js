@@ -178,6 +178,7 @@ async function handleMiniHealthChat(req, res, body) {
                     reply,
                     suggestions,
                     careServiceCard,
+                    ui_actions: Array.isArray(data.ui_actions) ? data.ui_actions : [],
                     requestId,
                     source: 'wechat-archiver-gateway',
                 });
